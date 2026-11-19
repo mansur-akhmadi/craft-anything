@@ -243,6 +243,18 @@ fn starting_twice_reuses_and_a_session_ending_stops_it() {
 }
 
 #[test]
+fn only_a_port_that_cant_be_had_is_a_listen_failure() {
+    use std::io::{Error, ErrorKind};
+    for kind in [ErrorKind::AddrInUse, ErrorKind::PermissionDenied, ErrorKind::AddrNotAvailable] {
+        assert!(port_refused(&Error::from(kind)), "{kind:?}");
+    }
+    // What setting up a bound socket or spawning its thread can fail with.
+    for kind in [ErrorKind::WouldBlock, ErrorKind::OutOfMemory, ErrorKind::InvalidInput, ErrorKind::Other] {
+        assert!(!port_refused(&Error::from(kind)), "{kind:?}");
+    }
+}
+
+#[test]
 fn a_chosen_port_and_stopping_several() {
     within(60, || {
         let dir = crate::testing::temp_dir();

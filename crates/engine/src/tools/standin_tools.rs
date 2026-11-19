@@ -487,6 +487,13 @@ fn serve_on(port: u16, answerer: Arc<dyn Answerer>, wait: std::time::Duration) -
     }
 }
 
+/// The port itself couldn't be had: taken, refused to this user, or not on this host. A failure
+/// after the bind (setting the socket up, starting its thread) would fail the same on any port.
+fn port_refused(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{AddrInUse, AddrNotAvailable, PermissionDenied};
+    matches!(e.kind(), AddrInUse | PermissionDenied | AddrNotAvailable)
+}
+
 fn web_standin_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, ToolError> {
     let p: StartParams = parse_params(params)?;
     let file = standin_path(&p.path)?;
@@ -520,9 +527,9 @@ fn web_standin_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         None => (p.port, false),
     };
     let server = serve_on(port, answerer, if taken_over { TAKEOVER_WAIT } else { std::time::Duration::ZERO }).map_err(|e| {
-        ToolError::io(format!("listening on port {port}"), e)
-            .with_remediation("Pick another port, or leave port out to use a free one.")
-            .with_details(json!({"reason": "listen_failed", "port": port}))
+        let refused = port_refused(&e);
+        let err = ToolError::io(format!("listening on port {port}"), e).with_remediation("Pick another port, or leave port out to use a free one.");
+        if refused { err.with_details(json!({"reason": "listen_failed", "port": port})) } else { err }
     })?;
     let id = {
         let mut next = all.next.lock().unwrap_or_else(PoisonError::into_inner);
