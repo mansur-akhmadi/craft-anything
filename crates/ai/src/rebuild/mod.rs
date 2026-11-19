@@ -724,6 +724,12 @@ impl Worker {
     }
 
     fn call(&self, tool: &str, params: Value) -> Result<ToolOutput, ToolError> {
+        self.call_then(tool, params, |_| {})
+    }
+
+    /// [`Worker::call`], showing `seen` the result before the feed is told, so what the call made
+    /// can be taken charge of before the feed's callbacks run.
+    fn call_then(&self, tool: &str, params: Value, seen: impl FnOnce(&Result<ToolOutput, ToolError>)) -> Result<ToolOutput, ToolError> {
         self.stop.check()?;
         // The person started this run for this target, which is the consent for opening it.
         let opts = CallOptions::new(Caller::Ui).with_consent(craft_anything_engine::Consent::Granted).with_cancel(self.stop.clone());
@@ -731,6 +737,7 @@ impl Worker {
         let call_id = format!("run-{tool}");
         self.emit(RunEvent::Agent(AgentEvent::ToolStarted { call_id: call_id.clone(), tool: tool.to_string(), input: Value::Null }));
         let result = self.engine.call(tool, params, opts);
+        seen(&result);
         self.emit(RunEvent::Agent(AgentEvent::ToolFinished { call_id, tool: tool.to_string(), ok: result.is_ok(), summary: String::new(), evidence_id: None }));
         result
     }
@@ -994,7 +1001,7 @@ impl Worker {
         // Served before the brief is written, so the brief can give its address. It listens on
         // this computer only, so a coding agent on another one isn't given it.
         if !study::tools_run_remotely(remote, api_loop) {
-            self.standin = self.start_standin(ws, deep);
+            self.start_standin(ws, deep);
         }
         let standin = self.standin.as_ref().map(|s| s.url.clone());
         // The builder's tool server is started in this run's mode (`--deep` or `--clean-room`).

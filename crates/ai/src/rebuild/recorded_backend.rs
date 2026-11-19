@@ -45,6 +45,20 @@ pub(super) fn recording(ws: &Workspace) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
+/// A stand-in this run started and doesn't hold yet, stopped if it's dropped still here: an event's
+/// callback that panics before the run takes it would otherwise leave it running in the session.
+struct Unkept(Option<RunningStandIn>);
+
+impl Drop for Unkept {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take()
+            && let Some(servers) = &s.servers
+        {
+            servers.stop(&s.id);
+        }
+    }
+}
+
 /// What the builder is told about a stand-in the run serves, in the brief and in each later
 /// message (its address can change from one run to the next).
 pub(super) fn running_words(url: &str) -> String {
@@ -57,53 +71,60 @@ impl Worker {
     /// Build a stand-in from the capture's recording and serve it, on the port the project's last
     /// one used when that's free. Only a Deep website build has one: Clean room reads nothing
     /// inside the original. A stand-in that can't be built or started is said in the feed and the
-    /// build goes on without it; the builder can still make one with the tools.
-    pub(super) fn start_standin(&self, ws: &mut Workspace, deep: bool) -> Option<RunningStandIn> {
+    /// build goes on without it; the builder can still make one with the tools. The one it serves is
+    /// [`Worker::standin`], held before anything is said about it.
+    pub(super) fn start_standin(&mut self, ws: &mut Workspace, deep: bool) {
         if !deep || !matches!(ws.manifest.target, TargetRef::Website { .. }) {
-            return None;
+            return;
         }
-        let har = recording(ws)?;
+        let Some(har) = recording(ws) else { return };
         let saved = ws.manifest.standin_port.filter(|p| *p != 0);
-        match self.serve_recording(ws, &har, saved) {
+        let mut unkept = Unkept(None);
+        match self.serve_recording(ws, &har, saved, &mut unkept) {
             Ok(running) => {
                 let moved = saved
                     .filter(|p| port_of(&running.url) != Some(*p))
                     .map(|p| format!(" (port {p}, the one it used last time, is taken)"))
                     .unwrap_or_default();
-                self.emit(RunEvent::Agent(AgentEvent::Status {
-                    text: format!("A stand-in backend answers from the original's recording at {}{moved}.", running.url),
-                }));
-                Some(running)
+                let text = format!("A stand-in backend answers from the original's recording at {}{moved}.", running.url);
+                self.standin = Some(running);
+                unkept.0 = None;
+                self.emit(RunEvent::Agent(AgentEvent::Status { text }));
             }
-            Err(e) if e.code == ErrorCode::Cancelled => None,
+            Err(e) if e.code == ErrorCode::Cancelled => {}
             Err(e) => {
                 self.emit(RunEvent::Agent(AgentEvent::Status {
                     text: format!("Couldn't start a stand-in backend from the original's recording ({}), so the builder isn't given one.", e.message),
                 }));
-                None
             }
         }
     }
 
-    fn serve_recording(&self, ws: &mut Workspace, har: &Path, saved: Option<u16>) -> Result<RunningStandIn, ToolError> {
+    fn serve_recording(&self, ws: &mut Workspace, har: &Path, saved: Option<u16>, unkept: &mut Unkept) -> Result<RunningStandIn, ToolError> {
         let dir = ws.capture_dir().join(STANDIN_DIR);
         self.call("web_standin_build", json!({"path": har.display().to_string(), "output_dir": dir.display().to_string(), "limit": 1}))?;
         let dir = dir.display().to_string();
-        let started = match saved {
-            Some(port) => self.call("web_standin_start", json!({"path": dir, "port": port})).or_else(|e| {
+        // What it starts is kept in `unkept` before the feed hears the call finished.
+        let mut start = |params: Value| {
+            self.call_then("web_standin_start", params, |r| {
+                if let Ok(out) = r {
+                    unkept.0 = self.running_from(out);
+                }
+            })
+        };
+        match saved {
+            Some(port) => start(json!({"path": dir, "port": port})).or_else(|e| {
                 // Only a port that couldn't be listened on gives way to a free one; anything else
                 // would fail the same way again.
-                if e.code != ErrorCode::FileError {
+                if !listen_failed(&e) {
                     return Err(e);
                 }
-                self.call("web_standin_start", json!({"path": dir}))
+                start(json!({"path": dir}))
             })?,
-            None => self.call("web_standin_start", json!({"path": dir}))?,
+            None => start(json!({"path": dir}))?,
         };
-        let (id, url, ours) = started_standin(&started).ok_or_else(|| ToolError::internal("web_standin_start didn't say where it listens"))?;
-        // Read once the tool has made them; no other guard is held here.
-        let servers = if ours { self.engine.session().ext.get::<Servers>() } else { None };
-        if let Some(port) = port_of(&url)
+        let running = unkept.0.clone().ok_or_else(|| ToolError::internal("web_standin_start didn't say where it listens"))?;
+        if let Some(port) = port_of(&running.url)
             && ws.manifest.standin_port != Some(port)
         {
             // It's serving already: a port that couldn't be kept costs only a new one next time,
@@ -113,7 +134,15 @@ impl Worker {
                 log::warn!("Couldn't keep the stand-in backend's port in {}: {}", ws.root.display(), e.message);
             }
         }
-        Ok(RunningStandIn { id, url, servers })
+        Ok(running)
+    }
+
+    /// The stand-in a `web_standin_start` answer names, with the session's stand-ins to stop it with
+    /// when it started it. Read once the tool has made them; no other guard is held here.
+    fn running_from(&self, out: &ToolOutput) -> Option<RunningStandIn> {
+        let (id, url, ours) = started_standin(out)?;
+        let servers = if ours { self.engine.session().ext.get::<Servers>() } else { None };
+        Some(RunningStandIn { id, url, servers })
     }
 
     /// Stop the stand-in this run started. Called as the run ends, also when it was paused or
@@ -125,6 +154,11 @@ impl Worker {
             log::info!("The build's stand-in backend {} had already stopped.", running.id);
         }
     }
+}
+
+/// `web_standin_start` couldn't listen on the port asked for: taken, or refused to this user.
+fn listen_failed(e: &ToolError) -> bool {
+    e.details.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str) == Some("listen_failed")
 }
 
 /// The id and address `web_standin_start` answered with, and whether it started that server: one
@@ -147,6 +181,12 @@ mod tests {
     use super::*;
     use crate::rebuild::tests::check_worker;
     use std::io::{Read, Write};
+
+    /// What `start_standin` left the run holding, taken so the test stops it as the run would.
+    fn start(w: &mut Worker, ws: &mut Workspace, deep: bool) -> Option<RunningStandIn> {
+        w.start_standin(ws, deep);
+        w.standin.take()
+    }
 
     fn site(dir: &Path) -> Workspace {
         Workspace::create(dir, "Site", "Rebuild this", TargetRef::Website { url: "https://example.com".into() }).unwrap()
@@ -195,8 +235,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = site(d.path());
         record(&ws);
-        let w = check_worker(&ws, true);
-        let s = w.start_standin(&mut ws, true).expect("a stand-in for the recording");
+        let mut w = check_worker(&ws, true);
+        let s = start(&mut w, &mut ws, true).expect("a stand-in for the recording");
         assert!(s.url.starts_with("http://127.0.0.1:"), "{s:?}");
         let answer = get(&s.url, "/v1/items/42").unwrap();
         assert!(answer.starts_with("HTTP/1.1 200") && answer.contains("{\"title\":\"Recorded\"}"), "{answer}");
@@ -218,8 +258,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = site(d.path());
         record(&ws);
-        let w = check_worker(&ws, true);
-        let s = w.start_standin(&mut ws, true).unwrap();
+        let mut w = check_worker(&ws, true);
+        let s = start(&mut w, &mut ws, true).unwrap();
         w.engine.session().settings.deep_mode = false;
         assert!(w.engine.call("web_standin_stop", json!({"id": s.id}), CallOptions::new(Caller::Ui)).is_err(), "Clean room refuses the tool");
         w.stop_standin(&s);
@@ -233,9 +273,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = site(d.path());
         record(&ws);
-        let w = check_worker(&ws, true);
-        let theirs = w.start_standin(&mut ws, true).unwrap();
-        let again = w.start_standin(&mut ws, true).unwrap();
+        let mut w = check_worker(&ws, true);
+        let theirs = start(&mut w, &mut ws, true).unwrap();
+        let again = start(&mut w, &mut ws, true).unwrap();
         assert_eq!((again.id.as_str(), again.url.as_str()), (theirs.id.as_str(), theirs.url.as_str()));
         w.stop_standin(&again);
         assert_eq!(running(&w).len(), 1, "it wasn't this run's to stop");
@@ -249,20 +289,20 @@ mod tests {
         // Clean room reads nothing inside the original, the recording included.
         let mut ws = site(&d.path().join("clean"));
         record(&ws);
-        let w = check_worker(&ws, false);
-        assert!(w.start_standin(&mut ws, false).is_none());
+        let mut w = check_worker(&ws, false);
+        assert!(start(&mut w, &mut ws, false).is_none());
         // A program or a request alone has no recorded backend.
         for target in [TargetRef::None, TargetRef::Local { path: d.path().join("App") }] {
             let mut ws = Workspace::create(&d.path().join("other"), "App", "Rebuild this", target).unwrap();
             record(&ws);
-            assert!(check_worker(&ws, true).start_standin(&mut ws, true).is_none());
+            assert!(start(&mut check_worker(&ws, true), &mut ws, true).is_none());
             assert!(!ws.capture_dir().join(STANDIN_DIR).exists());
         }
         // A website whose capture kept no recording.
         let mut ws = site(&d.path().join("unrecorded"));
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
-        let w = check_worker(&ws, true);
-        assert!(w.start_standin(&mut ws, true).is_none());
+        let mut w = check_worker(&ws, true);
+        assert!(start(&mut w, &mut ws, true).is_none());
         assert!(notes(&w).is_empty(), "nothing to say: {:?}", notes(&w));
         assert!(running(&w).is_empty());
         assert!(!ws.capture_dir().join(STANDIN_DIR).exists());
@@ -276,14 +316,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut ws = site(d.path());
         record(&ws);
-        let first = check_worker(&ws, true);
-        let held = first.start_standin(&mut ws, true).unwrap();
+        let mut first = check_worker(&ws, true);
+        let held = start(&mut first, &mut ws, true).unwrap();
         let saved = port_of(&held.url).unwrap();
         // Another session (the next build, while this one's still serves) asks for the saved port.
         let mut again = Workspace::open(&ws.root).unwrap();
         assert_eq!(again.manifest.standin_port, Some(saved));
-        let second = check_worker(&again, true);
-        let moved = second.start_standin(&mut again, true).expect("a free port instead");
+        let mut second = check_worker(&again, true);
+        let moved = start(&mut second, &mut again, true).expect("a free port instead");
         assert_ne!(port_of(&moved.url), Some(saved));
         assert!(notes(&second).iter().any(|n| n.contains(&format!("port {saved}, the one it used last time, is taken"))), "{:?}", notes(&second));
         assert!(get(&moved.url, "/v1/items/42").unwrap().contains("Recorded"));
@@ -292,14 +332,61 @@ mod tests {
         first.stop_standin(&held);
     }
 
+    /// A feed callback that panics as the start finishes, or as the stand-in is said, leaves
+    /// nothing running once the run has stopped what it holds.
+    #[test]
+    fn a_callback_that_panics_while_it_starts_leaves_nothing_running() {
+        let panics_at = |w: &mut Worker, at: usize| {
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            w.wake = Wake::new(move || assert_ne!(calls.fetch_add(1, Ordering::SeqCst) + 1, at, "a window's callback failed"));
+        };
+        // The build's two events, then the start's: started, finished, and what's said about it.
+        for at in [4, 5] {
+            let d = tempfile::tempdir().unwrap();
+            let mut ws = site(d.path());
+            record(&ws);
+            let mut w = check_worker(&ws, true);
+            panics_at(&mut w, at);
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.start_standin(&mut ws, true))).is_err());
+            w.wake = Wake::default();
+            if let Some(s) = w.standin.take() {
+                w.stop_standin(&s);
+            }
+            assert!(running(&w).is_empty(), "the callback panicked at event {at}");
+        }
+        // One already serving isn't this run's to stop, panic or not.
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = site(d.path());
+        record(&ws);
+        let mut w = check_worker(&ws, true);
+        let theirs = start(&mut w, &mut ws, true).unwrap();
+        panics_at(&mut w, 4);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.start_standin(&mut ws, true))).is_err());
+        w.wake = Wake::default();
+        assert_eq!(running(&w).len(), 1);
+        w.stop_standin(&theirs);
+    }
+
+    #[test]
+    fn only_a_port_that_couldnt_be_listened_on_gives_way_to_another() {
+        let listen = |kind: std::io::ErrorKind| {
+            ToolError::io("listening on port 8080", std::io::Error::from(kind)).with_details(json!({"reason": "listen_failed", "port": 8080}))
+        };
+        let refused = listen(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(refused.code, ErrorCode::NoPermission);
+        assert!(listen_failed(&refused) && listen_failed(&listen(std::io::ErrorKind::AddrInUse)));
+        assert!(!listen_failed(&ToolError::io("reading standin.json", std::io::Error::other("bad"))), "a file that won't read fails on any port");
+        assert!(!listen_failed(&ToolError::new(ErrorCode::NoPermission, "no").with_details(json!({"reason": "other"}))));
+    }
+
     #[test]
     fn a_recording_that_cant_be_read_is_said_and_the_build_goes_on() {
         let d = tempfile::tempdir().unwrap();
         let mut ws = site(d.path());
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
         std::fs::write(ws.capture_dir().join(study::RECORDING), "not a recording").unwrap();
-        let w = check_worker(&ws, true);
-        assert!(w.start_standin(&mut ws, true).is_none());
+        let mut w = check_worker(&ws, true);
+        assert!(start(&mut w, &mut ws, true).is_none());
         let said = notes(&w);
         assert!(said.iter().any(|n| n.starts_with("Couldn't start a stand-in backend")), "{said:?}");
         assert!(running(&w).is_empty());

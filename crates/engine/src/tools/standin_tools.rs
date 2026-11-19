@@ -519,8 +519,11 @@ fn web_standin_start(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, Too
         }
         None => (p.port, false),
     };
-    let server = serve_on(port, answerer, if taken_over { TAKEOVER_WAIT } else { std::time::Duration::ZERO })
-        .map_err(|e| ToolError::io(format!("listening on port {port}"), e).with_remediation("Pick another port, or leave port out to use a free one."))?;
+    let server = serve_on(port, answerer, if taken_over { TAKEOVER_WAIT } else { std::time::Duration::ZERO }).map_err(|e| {
+        ToolError::io(format!("listening on port {port}"), e)
+            .with_remediation("Pick another port, or leave port out to use a free one.")
+            .with_details(json!({"reason": "listen_failed", "port": port}))
+    })?;
     let id = {
         let mut next = all.next.lock().unwrap_or_else(PoisonError::into_inner);
         *next = next.saturating_add(1);
