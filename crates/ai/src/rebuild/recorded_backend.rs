@@ -27,22 +27,12 @@ impl std::fmt::Debug for RunningStandIn {
     }
 }
 
-/// The recording of the original's traffic the capture kept: the study's own file, or else the
-/// first `.har` in `capture/` by name, so the choice doesn't depend on the order the folder lists.
+/// The recording of the original's traffic the study made, by the name it writes. Another `.har`
+/// in `capture/` (one recorded while signed in, say) isn't served: the builder can still make a
+/// stand-in from it with the tools.
 pub(super) fn recording(ws: &Workspace) -> Option<PathBuf> {
-    let capture = ws.capture_dir();
-    let own = capture.join(study::RECORDING);
-    if own.is_file() {
-        return Some(own);
-    }
-    let mut found: Vec<PathBuf> = std::fs::read_dir(&capture)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("har")))
-        .collect();
-    found.sort();
-    found.into_iter().next()
+    let own = ws.capture_dir().join(study::RECORDING);
+    own.is_file().then_some(own)
 }
 
 /// A stand-in this run started and doesn't hold yet, stopped if it's dropped still here: an event's
@@ -394,15 +384,17 @@ mod tests {
     }
 
     #[test]
-    fn the_studys_own_recording_comes_before_any_other() {
+    fn only_the_studys_own_recording_is_served() {
         let d = tempfile::tempdir().unwrap();
         let ws = site(d.path());
         std::fs::create_dir_all(ws.capture_dir()).unwrap();
         assert_eq!(recording(&ws), None);
-        std::fs::write(ws.capture_dir().join("b.HAR"), "{}").unwrap();
+        // Another recording in capture/ (one made while signed in, say) isn't the study's.
         std::fs::write(ws.capture_dir().join("a.har"), "{}").unwrap();
-        std::fs::create_dir_all(ws.capture_dir().join("0.har")).unwrap();
-        assert_eq!(recording(&ws), Some(ws.capture_dir().join("a.har")), "the first file by name; a folder isn't one");
+        assert_eq!(recording(&ws), None, "only the study's own file");
+        std::fs::create_dir_all(ws.capture_dir().join(study::RECORDING)).unwrap();
+        assert_eq!(recording(&ws), None, "a folder isn't a recording");
+        std::fs::remove_dir(ws.capture_dir().join(study::RECORDING)).unwrap();
         record(&ws);
         assert_eq!(recording(&ws), Some(ws.capture_dir().join(study::RECORDING)));
     }

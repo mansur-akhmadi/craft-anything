@@ -4757,7 +4757,7 @@ fn a_website_brief_offers_a_stand_in_backend_only_when_the_capture_has_a_recordi
     craft_anything_engine::tools::browser_tools::write_recording(&requests, &capture.join(crate::rebuild::study::RECORDING)).unwrap();
     let with = brief(&ws, "website", true, false, None, false, None);
     assert!(with.contains("web_standin_build") && with.contains("web_standin_start"), "{with}");
-    assert!(!with.contains("Craft Anything started a stand-in"), "none is running: {with}");
+    assert!(!with.contains("is already serving a stand-in"), "none is running: {with}");
     // One the run already serves is given by its address.
     let cx = BriefCx {
         ws: &ws,
@@ -4771,6 +4771,8 @@ fn a_website_brief_offers_a_stand_in_backend_only_when_the_capture_has_a_recordi
     };
     let served = super::brief(kind("website").as_ref(), &cx, None);
     assert!(served.contains("web_standin_build") && served.contains("http://127.0.0.1:4100 answers your front end"), "{served}");
+    // The words the negative check above looks for are the ones a running stand-in is given in.
+    assert!(served.contains("is already serving a stand-in"), "{served}");
     // Clean room reads nothing inside the original, so its brief never offers it.
     let clean = brief(&ws, "website", false, false, None, false, None);
     assert!(!clean.contains("web_standin"), "{clean}");

@@ -91,7 +91,9 @@ fn website_from_outside(sees: bool) -> String {
 /// stand-in backend its own front end talks to, rather than calling an API that isn't there. When
 /// the run already serves one, its address is given too.
 fn standin_words(cx: &BriefCx) -> String {
-    if super::recorded_backend::recording(cx.ws).is_none() {
+    let has_recording =
+        std::fs::read_dir(cx.ws.root.join("capture")).is_ok_and(|rd| rd.flatten().any(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("har"))));
+    if !has_recording {
         return String::new();
     }
     match cx.standin {
