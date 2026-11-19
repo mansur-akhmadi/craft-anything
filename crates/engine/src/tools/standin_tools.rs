@@ -393,9 +393,20 @@ impl Running {
 
 /// The stand-ins this session is running. Dropped with the session, which stops them.
 #[derive(Default)]
-struct StandIns {
+pub struct StandIns {
     running: Mutex<BTreeMap<String, Running>>,
     next: Mutex<u64>,
+}
+
+impl StandIns {
+    /// Stop the stand-in `web_standin_start` named `id`, without the session: a rebuild run stops
+    /// the one it started as it ends, whatever holds the session then and whichever mode it's in.
+    /// Says whether it was still running.
+    pub fn stop(&self, id: &str) -> bool {
+        let stopped = self.running.lock().unwrap_or_else(PoisonError::into_inner).remove(id);
+        // Stopped outside the lock: stopping can take a moment.
+        stopped.is_some()
+    }
 }
 
 fn stand_ins(ctx: &mut Ctx<'_>) -> Arc<StandIns> {
