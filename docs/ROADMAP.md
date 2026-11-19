@@ -2580,6 +2580,7 @@ Owner: open · Status: in progress
       (`analysis::web_har::har_from_network`, `browser_tools::write_recording`)
 - [ ] Live-check a Deep website study's recording on a real site, and the stand-in built from it
 - [ ] Start a stand-in backend from a recording automatically when a build begins
+      — claimed: mansur-akhmadi, branch feature/r3.11-standin-on-build-start
 - [x] Stand-in backend: retain 304 samples without a usable cached body for diagnostics, skip them
       during replay, and report `cached_body_unavailable` when the best matching group has no
       usable answer. Build results count them; cached bodies still answer as 200 (#543)
