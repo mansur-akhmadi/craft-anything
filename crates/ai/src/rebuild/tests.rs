@@ -1705,6 +1705,85 @@ impl TargetKind for SheetKind {
     }
 }
 
+/// Reads the stand-in at `url` the way a check's browser would: the list, then adds twice.
+struct StandInProbe(String);
+
+impl StandInProbe {
+    fn send(&self, raw: &str) -> String {
+        use std::io::{Read, Write};
+        let port: u16 = self.0.rsplit(':').next().unwrap().parse().unwrap();
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.write_all(raw.replace("{HOST}", &format!("127.0.0.1:{port}")).as_bytes()).unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    }
+    fn add(&self) -> String {
+        self.send("POST /todos HTTP/1.1\r\nHost: {HOST}\r\nContent-Length: 2\r\n\r\n{}")
+    }
+}
+
+impl Check for StandInProbe {
+    fn id(&self) -> &'static str {
+        "probe"
+    }
+    fn run(&self, cx: &mut CheckCx) -> Result<CheckResult, ToolError> {
+        let first = self.send("GET /todos HTTP/1.1\r\nHost: {HOST}\r\n\r\n");
+        let (added, again) = (self.add(), self.add());
+        let status = |r: &str| r.get(..12).unwrap_or(r).to_string();
+        let note = format!("first read {}; adds {} {}", first.rsplit("\r\n").next().unwrap_or_default(), status(&added), status(&again));
+        Ok(CheckResult::new(self.id(), cx.round, true, note))
+    }
+}
+
+struct ProbeKind(String);
+
+impl TargetKind for ProbeKind {
+    fn id(&self) -> &'static str {
+        "probe"
+    }
+    fn words(&self) -> KindWords {
+        KindWords { button: "Open", icon: "globe", ready: "Ready", change_hint: "Ask for a change" }
+    }
+    fn detect(&self, _cx: &DetectCx) -> Option<u32> {
+        None
+    }
+    fn default_stack(&self, _cx: &DetectCx) -> &'static str {
+        "Rust"
+    }
+    fn goal(&self) -> &'static str {
+        "a website"
+    }
+    fn checks(&self, _ws: &Workspace) -> Vec<Box<dyn Check>> {
+        vec![Box::new(StandInProbe(self.0.clone()))]
+    }
+}
+
+#[test]
+fn a_check_reads_a_stand_in_from_the_start_and_says_what_it_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let ws = Workspace::create(d.path(), "Todos", "Recreate this site", TargetRef::None).unwrap();
+    let entry = |method: &str, status: i64, text: &str| json!({"request": {"method": method, "url": "https://api.example.test/todos"}, "response": {"status": status, "content": {"mimeType": "application/json", "text": text}}});
+    let har = json!({"log": {"version": "1.2", "entries": [entry("GET", 200, r#"{"todos":[]}"#), entry("POST", 201, r#"{"id":1}"#), entry("GET", 200, r#"{"todos":[1]}"#)]}});
+    let (recording, out) = (d.path().join("site.har"), d.path().join("standin"));
+    std::fs::write(&recording, har.to_string()).unwrap();
+    let w = check_worker(&ws, true);
+    let call = |id: &str, p: serde_json::Value| w.engine.call(id, p, CallOptions::new(Caller::Mcp)).unwrap().to_json();
+    call("web_standin_build", json!({"path": recording, "output_dir": out}));
+    let url = call("web_standin_start", json!({"path": out}))["result"]["url"].as_str().unwrap().to_string();
+    // The builder's own trial add, before the check, moves the stand-in on and uses up the recorded add.
+    assert!(StandInProbe(url.clone()).add().starts_with("HTTP/1.1 201"));
+    assert!(StandInProbe(url.clone()).add().starts_with("HTTP/1.1 404"), "refused before the check, so not the check's to report");
+
+    let c = w.run_checks(&ws, &ProbeKind(url.clone()), 1).unwrap().remove(0);
+    assert!(c.note.contains(r#"first read {"todos":[]}"#), "the check's first read is the recording's first: {}", c.note);
+    assert!(c.note.contains("adds HTTP/1.1 201 HTTP/1.1 404"), "{}", c.note);
+    let said = c.note.split("adds HTTP/1.1 201 HTTP/1.1 404").nth(1).unwrap_or_default();
+    assert!(said.contains("stand-in") && said.contains("1 write"), "the check says what was refused during it, not before: {}", c.note);
+    call("web_standin_stop", json!({}));
+}
+
 #[test]
 fn builder_instructions_allow_an_unverified_comparison_to_remain_open() {
     for deep in [false, true] {

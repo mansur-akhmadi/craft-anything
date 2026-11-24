@@ -1236,6 +1236,64 @@ fn only_writes_are_counted_as_writes() {
     assert!(!is_write_request("POST", br#"{"query":"query List { list }"}"#));
     assert!(!is_write_request("GET", b""));
     assert!(!is_write_request("HEAD", b""));
+    let big = format!(r#"{{"query":"query List {{ list }}","pad":"{}"}}"#, "x".repeat(MAX_KEY_BODY));
+    assert!(!is_write_request("POST", big.as_bytes()), "too large to read, it could be a query: unanswered, not a refused write");
+    assert!(is_write_request("PUT", big.as_bytes()));
+}
+
+#[test]
+fn a_batch_naming_a_read_beside_a_query_sent_as_text_gets_the_recorded_read() {
+    let mut batch = entry("POST", &format!("{A}/graphql"), 200, r#"[{"data":{"a":1}},{"data":{"b":2}}]"#);
+    batch["request"]["postData"] = json!({"text": r#"[{"query":"query A { a }","operationName":"A"},{"query":"query B { b }","operationName":"B"}]"#});
+    let s = built(vec![batch]);
+    let mut t = Turns::default();
+    let mixed = br#"[{"operationName":"A"},{"operationName":"B","query":"query B { b }"}]"#;
+    assert_eq!(body(&found(answer(&s, &mut t, "POST", "/graphql", "", mixed))), r#"[{"data":{"a":1}},{"data":{"b":2}}]"#);
+    assert_eq!(t.position(), None);
+    // A mutation's own text in the batch still makes it a write nobody recorded.
+    let with_write = br#"[{"operationName":"A"},{"operationName":"B","query":"mutation B { b }"}]"#;
+    assert_eq!(missing(answer(&s, &mut t, "POST", "/graphql", "", with_write)).reason, NoMatchReason::WriteNotRecorded);
+}
+
+#[test]
+fn a_file_from_before_version_2_gives_a_write_each_recorded_answer_once() {
+    let mut list = entry("POST", &format!("{A}/graphql"), 200, r#"{"data":{"list":[]}}"#);
+    list["request"]["postData"] = json!({"text": r#"{"operationName":"List"}"#});
+    let mut s = built(vec![
+        entry("GET", &format!("{A}/todos"), 200, "[]"),
+        entry("POST", &format!("{A}/todos"), 201, r#"{"id":1}"#),
+        entry("POST", &format!("{A}/todos"), 201, r#"{"id":2}"#),
+        list,
+    ]);
+    // What a version-1 file migrates to: no places, nothing marked as a write.
+    for sample in s.routes.iter_mut().flat_map(|r| r.samples.iter_mut()) {
+        (sample.order, sample.write) = (None, false);
+    }
+    let mut t = Turns::default();
+    let adds: Vec<String> = (0..2).map(|_| body(&found(answer(&s, &mut t, "POST", "/todos", "", b"{}")))).collect();
+    assert_eq!(adds, [r#"{"id":1}"#, r#"{"id":2}"#]);
+    for _ in 0..2 {
+        assert_eq!(missing(answer(&s, &mut t, "POST", "/todos", "", b"{}")).reason, NoMatchReason::WriteNotRecorded, "past them, none");
+    }
+    assert_eq!(body(&found(get(&s, &mut t, "/todos", ""))), "[]", "reads still answer");
+    // Reads polled first don't use up a write's answers.
+    let mut ask = entry("POST", &format!("{A}/gql"), 200, r#"{"data":{"n":0}}"#);
+    ask["request"]["postData"] = json!({"text": r#"{"query":"query { n }"}"#});
+    let mut bump = entry("POST", &format!("{A}/gql"), 200, r#"{"data":{"bumped":true}}"#);
+    bump["request"]["postData"] = json!({"text": r#"{"query":"mutation { bump }"}"#});
+    let mut anon = built(vec![ask, bump]);
+    for sample in anon.routes.iter_mut().flat_map(|r| r.samples.iter_mut()) {
+        (sample.order, sample.write) = (None, false);
+    }
+    let mut t2 = Turns::default();
+    for _ in 0..3 {
+        let _ = found(answer(&anon, &mut t2, "POST", "/gql", "", br#"{"query":"query { n }"}"#));
+    }
+    let _ = found(answer(&anon, &mut t2, "POST", "/gql", "", br#"{"query":"mutation { bump }"}"#));
+    // Named only, a request may be a read, so it still takes its turns.
+    for _ in 0..3 {
+        assert_eq!(body(&found(answer(&s, &mut t, "POST", "/graphql", "", br#"{"operationName":"List"}"#))), r#"{"data":{"list":[]}}"#);
+    }
 }
 
 #[test]

@@ -2478,7 +2478,9 @@ Owner: open · Status: in progress
       Done: each sample keeps its place in the recording (`order`) and whether it answered a write
       (`write`, standin.json version 2); a replayed write the original accepted moves later reads of
       its path, and of paths above or under it, on to the answers recorded after it, a GraphQL query
-      sent by POST counts as a read, and a version-1 file replays as before
+      sent by POST counts as a read, and a version-1 file's answers replay in turn, with a write
+      getting each recorded one once; a build's check starts the stand-ins in the app's session
+      from the beginning and says in its result how many writes they refused
       — claimed: mansur-akhmadi, branch feature/r3.11-standin-writes-change-reads
 - [ ] Stand-in backend: a write steps to the next recorded write of its kind whatever it sends (another
       id or text gets the recorded answer), one past them or with no recorded match is refused and changes nothing; reads follow
@@ -2487,6 +2489,9 @@ Owner: open · Status: in progress
       a route keeps its first 16 answers, so the later states of a long recording are left out; a
       GraphQL operation named past the first 64 its document defines counts as a write (the reader
       keeps no more), and one whose recorded name was hidden is refused
+- [ ] Stand-in backend: a coding agent's builder starts its stand-ins through its own MCP server, so a
+      build's check can't take them back to the start, and the builder's trial requests during its turn
+      still move what the check then reads
 - [x] Tell the builder about the stand-in backend in a website's brief, when the capture kept a
       recording (`capture/*.har`): what `web_standin_build`, `web_standin_start` and the rest do
       (`brief::standin_words`); Deep mode only, since Clean room reads nothing inside the original

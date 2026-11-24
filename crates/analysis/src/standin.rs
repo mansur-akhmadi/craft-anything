@@ -156,7 +156,7 @@ pub struct Sample {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub was_not_modified: bool,
     /// Where in the recording this answer was given: its entry's index. Files before version 2
-    /// have none, and their answers replay in turn whatever is written.
+    /// have none: their answers replay in turn, and a write gets each one once.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order: Option<u64>,
     /// It answered a write: a method that isn't a read, unless the body was GraphQL that only
@@ -621,18 +621,24 @@ fn json_body(body: &[u8]) -> Option<Value> {
 /// carrying one is a read. A body naming its operation without the text (a persisted query) can't
 /// be told apart from a mutation, so it isn't.
 fn graphql_reads(v: &Value) -> bool {
-    let one = |o: &serde_json::Map<String, Value>| -> bool {
-        let Some(doc) = o.get("query").and_then(Value::as_str).and_then(|q| craft_anything_js::api_ops::read_document(q, true)) else { return false };
-        let name = o.get("operationName").and_then(Value::as_str).filter(|n| !n.is_empty());
-        // A name that isn't among the operations read (past the reader's cap, say) could be anything.
-        let runs: Vec<_> = doc.operations.iter().filter(|d| name.is_none() || d.name.as_deref() == name).collect();
-        !doc.open_ended && !runs.is_empty() && runs.iter().all(|d| d.kind == "query")
-    };
     match v {
-        Value::Object(o) => one(o),
-        Value::Array(a) => !a.is_empty() && a.len() <= MAX_KEY_NAMES && a.iter().all(|x| x.as_object().is_some_and(one)),
+        Value::Object(o) => only_queries(o),
+        Value::Array(a) => !a.is_empty() && a.len() <= MAX_KEY_NAMES && a.iter().all(|x| x.as_object().is_some_and(only_queries)),
         _ => false,
     }
+}
+
+/// One GraphQL request whose own text shows it only queries.
+fn only_queries(o: &serde_json::Map<String, Value>) -> bool {
+    let Some(doc) = own_document(o) else { return false };
+    let name = o.get("operationName").and_then(Value::as_str).filter(|n| !n.is_empty());
+    // A name that isn't among the operations read (past the reader's cap, say) could be anything.
+    let runs: Vec<_> = doc.operations.iter().filter(|d| name.is_none() || d.name.as_deref() == name).collect();
+    !doc.open_ended && !runs.is_empty() && runs.iter().all(|d| d.kind == "query")
+}
+
+fn own_document(o: &serde_json::Map<String, Value>) -> Option<craft_anything_js::api_ops::Document> {
+    o.get("query").and_then(Value::as_str).and_then(|q| craft_anything_js::api_ops::read_document(q, true))
 }
 
 fn key_of(v: &Value) -> Option<String> {
@@ -1214,6 +1220,9 @@ pub struct Turns {
     /// By route: the place of the last accepted write replayed. Reads of related paths answer from
     /// after it.
     accepted: BTreeMap<usize, u64>,
+    /// In a file without places: how many writes each set of answers has given, apart from the
+    /// reads' turns, so polling a read doesn't use up a write's answers.
+    untimed_writes: BTreeMap<(usize, usize, MatchKind), usize>,
 }
 
 impl Turns {
@@ -1252,16 +1261,17 @@ fn is_write(method: &str, json: Option<&Value>) -> bool {
 }
 
 /// Whether [`answer`] takes this request as a write, so a server can count the ones it refuses.
+/// A POST too large to read could be a query, so it's counted as a request with no answer.
 pub fn is_write_request(method: &str, body: &[u8]) -> bool {
     let method = method.to_ascii_uppercase();
-    method != "HEAD" && is_write(&method, json_body(body).as_ref())
+    method != "HEAD" && !(method == "POST" && body.len() > MAX_KEY_BODY) && is_write(&method, json_body(body).as_ref())
 }
 
-/// Whether a body carries GraphQL text of its own, not just an operation's name: then a write it
-/// asks for is known to be one, and a recorded read of the same name isn't its answer.
-fn has_document(v: &Value) -> bool {
-    let one =
-        |o: &serde_json::Map<String, Value>| o.get("query").and_then(Value::as_str).and_then(|q| craft_anything_js::api_ops::read_document(q, true)).is_some();
+/// Whether a body carries GraphQL text of its own that doesn't only query: then it's known to be
+/// a write, and a recorded read isn't its answer. Each request of a batch is judged by its own
+/// text, so one named only by its operation doesn't make the batch a write.
+fn writes_by_its_own_text(v: &Value) -> bool {
+    let one = |o: &serde_json::Map<String, Value>| own_document(o).is_some() && !only_queries(o);
     match v {
         Value::Object(o) => one(o),
         Value::Array(a) => a.iter().any(|x| x.as_object().is_some_and(one)),
@@ -1282,7 +1292,8 @@ fn after(order: u64, place: Option<u64>) -> bool {
 /// recorded reads apply: those between the last accepted write replayed on a related path and the
 /// next related one recorded, or else the earliest from after that place (which shows the client's
 /// own write), or else the newest from before it.
-/// When any answer has no place (a file from before version 2), all of them apply, as they did.
+/// When any answer has no place (a file from before version 2), all of them apply, and [`answer`]
+/// gives a write each of them once.
 fn on_timeline(
     standin: &StandIn,
     ri: usize,
@@ -1378,6 +1389,8 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     let key = json.as_ref().and_then(key_of);
     let key = key.as_deref();
     let write = is_write(look_for, json.as_ref());
+    // A request named only by its GraphQL operation may be a read the recording knows.
+    let known_write = write && (!key.is_some_and(|k| k.starts_with("op:")) || json.as_ref().is_some_and(writes_by_its_own_text));
 
     let mut operation_missing = false;
     let mut consider = |route: &StandInRoute, candidates: Vec<usize>| -> Option<Vec<usize>> {
@@ -1452,7 +1465,7 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     // beginning; without positions every answer takes one, as before positions were recorded.
     let timed = fit.iter().all(|i| route.samples.get(*i).is_some_and(|s| s.order.is_some()));
     // A mutation sent as text where only reads were recorded: none of them is its answer.
-    if timed && write && json.as_ref().is_some_and(has_document) && fit.iter().all(|i| route.samples.get(*i).is_some_and(|s| !s.write)) {
+    if timed && write && json.as_ref().is_some_and(writes_by_its_own_text) && fit.iter().all(|i| route.samples.get(*i).is_some_and(|s| !s.write)) {
         return Answer::NoMatch(NoMatch { reason: NoMatchReason::WriteNotRecorded, nearest: Vec::new() });
     }
     let Some((fit, stepping)) = on_timeline(standin, ri, route, fit, turns, write, key) else {
@@ -1460,7 +1473,13 @@ pub fn answer(standin: &StandIn, turns: &mut Turns, method: &str, path: &str, qu
     };
     let at = match fit.first() {
         Some(first) if fit.len() > 1 || !timed => {
-            let counter = turns.turns.entry((ri, *first, how)).or_insert(0);
+            // A file from before version 2 can't tell its writes from its reads: a write takes each
+            // recorded answer once, then gets none, like a write past the recorded ones on a timeline.
+            let untimed_write = !timed && known_write;
+            let counter = if untimed_write { &mut turns.untimed_writes } else { &mut turns.turns }.entry((ri, *first, how)).or_insert(0);
+            if untimed_write && *counter >= fit.len() {
+                return Answer::NoMatch(NoMatch { reason: NoMatchReason::WriteNotRecorded, nearest: Vec::new() });
+            }
             let at = counter.checked_rem(fit.len()).unwrap_or(0);
             *counter = counter.saturating_add(1);
             at

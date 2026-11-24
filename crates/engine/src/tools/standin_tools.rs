@@ -40,10 +40,10 @@ const STANDIN_STEPS: &[Step<Value>] = &[v1_places_unknown];
 const FIRST_STANDIN_VERSION: u32 = 1;
 const _: () = assert!(FIRST_STANDIN_VERSION as usize + STANDIN_STEPS.len() == STANDIN_VERSION as usize);
 
-const REPLAY_LIMIT: &str = "Replay follows the recording: a POST, PUT, PATCH or DELETE the original accepted moves later reads of its path, and of paths above or under it, on to the answers recorded after it. Nothing is worked out from what is sent: a write steps to the next recorded write of its kind whatever it carries, one with no recorded match changes nothing, and a write to an unrelated path (a sign-in changing /me) isn't seen. A running stand-in keeps one place in the recording for all its clients; stop it and start it again to go back to the beginning.";
+const REPLAY_LIMIT: &str = "Replay follows the recording: a POST, PUT, PATCH or DELETE the original accepted moves later reads of its path, and of paths above or under it, on to the answers recorded after it. Nothing is worked out from what is sent: a write steps to the next recorded write of its kind whatever it carries, one with no recorded match changes nothing, and a write to an unrelated path (a sign-in changing /me) isn't seen. A running stand-in keeps one place in the recording for all its clients; a build's check starts the stand-ins the app itself runs from the beginning, and stopping and starting one does too.";
 
-/// Version 1 kept no places in the recording: its answers replay in turn whatever is written, as
-/// they did, so there is nothing to rewrite.
+/// Version 1 kept no places in the recording: its answers replay in turn, and a write gets each
+/// one once ([`standin::answer`]), so there is nothing to rewrite.
 fn v1_places_unknown(_: &mut Value) -> Result<(), String> {
     Ok(())
 }
@@ -407,6 +407,28 @@ fn stand_ins(ctx: &mut Ctx<'_>) -> Arc<StandIns> {
             s
         }
     }
+}
+
+/// For a build's check: put every stand-in this session runs back at the start of its recording,
+/// so the check reads from a known place whatever was written before it. Returns how many writes
+/// they have refused so far, for [`writes_refused`] to count the check's own from.
+pub fn start_of_check(session: &crate::Session) -> u64 {
+    refused_by_each(session, |turns| *turns = Turns::default())
+}
+
+/// How many writes the stand-ins this session runs have refused, all told.
+pub fn writes_refused(session: &crate::Session) -> u64 {
+    refused_by_each(session, |_| ())
+}
+
+fn refused_by_each(session: &crate::Session, mut each: impl FnMut(&mut Turns)) -> u64 {
+    let Some(all) = session.ext.get::<StandIns>() else { return 0 };
+    let running = all.running.lock().unwrap_or_else(PoisonError::into_inner);
+    running.values().fold(0, |sum, r| {
+        let mut state = r.replay.state.lock().unwrap_or_else(PoisonError::into_inner);
+        each(&mut state.0);
+        sum.saturating_add(state.1.writes_refused)
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
