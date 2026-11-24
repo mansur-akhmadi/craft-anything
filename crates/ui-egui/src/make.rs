@@ -7,6 +7,7 @@ use crate::state::{MakeDraft, Screen};
 use crate::theme::{self, Tokens};
 use crate::{CraftApp, Pick, icons, widgets};
 use craft_anything_engine::Mode;
+use craft_anything_engine::tools::web_common;
 use craft_anything_engine::workspace::{ExistingFiles, Status, TargetRef};
 use egui::{RichText, Sense, Ui, Vec2};
 
@@ -158,10 +159,14 @@ pub fn hero(app: &mut CraftApp, ui: &mut Ui, w: f32) {
         ui.horizontal(|ui| {
             crate::builders::built_by(app, ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ready = !app.state.make.request.trim().is_empty() && url_problem(&app.state.make.url).is_none() && app.creating.is_none();
+                let ready = !app.state.make.request.trim().is_empty()
+                    && url_problem(&app.state.make.url).is_none()
+                    && app.creating.is_none()
+                    && app.signing_in.is_none();
                 let start =
                     ui.add(widgets::Button::new(widgets::ButtonKind::Primary, "Start").icon(Some("sparkles")).size(theme::ControlSize::Hero).enabled(ready));
-                let start = if ready { start } else { start.on_disabled_hover_text(tr("Say what you want first.")) };
+                let wait = if app.signing_in.is_some() { "Finish signing in to the site first." } else { "Say what you want first." };
+                let start = if ready { start } else { start.on_disabled_hover_text(tr(wait)) };
                 if (start.clicked() || submit) && ready {
                     app.start_make();
                 }
@@ -409,6 +414,87 @@ fn choose_target(app: &mut CraftApp, ui: &mut Ui) {
             });
         }
     }
+    let m = &app.state.make;
+    // Nothing typed or picked: Start studies the address in the request (`resolve_target`), so
+    // that one can be signed in to as well.
+    let from_request = m.url.trim().is_empty() && m.target == TargetRef::None;
+    let url = if from_request { find_url(&m.request) } else { website.then(|| normalize_url(&m.url)) };
+    let url = url.filter(|u| url_problem(u).is_none());
+    // A window already open stays in view (with its way out) whatever is picked meanwhile.
+    if url.is_some() || app.signing_in.is_some() {
+        sign_in(app, ui, url.as_deref(), from_request);
+    }
+}
+
+/// A site that shows more to someone signed in: the person signs in to it in a browser window
+/// of its own, and studies of the site then see what they see (`web_site_sign_in`). One saved
+/// already is said, with a way to forget it (`web_site_sign_out`).
+fn sign_in(app: &mut CraftApp, ui: &mut Ui, url: Option<&str>, from_request: bool) {
+    let t = Tokens::get(ui.ctx());
+    ui.add_space(theme::space::SM);
+    ui.horizontal_wrapped(|ui| {
+        icons::show(ui, "key-round", theme::icon::MD, t.icon);
+        if let Some(job) = app.signing_in {
+            ui.label(RichText::new(tr("Sign in in the browser window that opened, then close it.")).size(theme::SMALL).color(t.text_dim));
+            if widgets::link(ui, "Stop waiting").clicked() {
+                app.jobs.cancel(job);
+            }
+        } else if let Some(url) = url {
+            // The address isn't in view up here: name the site it's for.
+            if from_request {
+                let (from, site) = (tr("From your request:"), site_name(&serde_json::json!({ "url": url })));
+                ui.label(RichText::new(format!("{from} {site}")).size(theme::SMALL).color(t.text));
+            }
+            let saved = app.sign_in_saved(url);
+            let question = tr(if saved { "A sign-in is saved for this site, and studies of it use it." } else { "Does the site show more once you're signed in?" });
+            ui.label(RichText::new(question).size(theme::SMALL).color(t.text_dim));
+            let hint = tr(if saved {
+                "The window opens with the saved sign-in; what you leave when you close it replaces it. To use another account, sign out on the site there first."
+            } else {
+                "A browser window opens: sign in there yourself, then close it. Craft Anything never sees your password. The sign-in is kept on this computer and used when this site is studied."
+            });
+            let free = app.creating.is_none();
+            let busy = tr("Wait until the new project is made.");
+            let button = ui.add(widgets::Button::new(widgets::ButtonKind::Secondary, "Sign in to this site").enabled(free));
+            let button = if free { button.on_hover_text(hint) } else { button.on_disabled_hover_text(busy.as_str()) };
+            if button.clicked() && free {
+                app.sign_in_to_site(url);
+            }
+            if saved {
+                let forget = ui.add(widgets::Button::new(widgets::ButtonKind::Secondary, "Forget the saved sign-in").enabled(free));
+                let forget = if free { forget.on_hover_text(tr("Studies of this site start signed out again.")) } else { forget.on_disabled_hover_text(busy.as_str()) };
+                if forget.clicked() && free {
+                    app.forget_site_sign_in(url);
+                }
+            }
+        }
+    });
+}
+
+/// What to tell the person once a sign-in window has closed, from `web_site_sign_in`'s result,
+/// and whether it's a warning.
+pub fn sign_in_words(result: &serde_json::Value) -> (String, bool) {
+    let check = &result["check"];
+    match result["ended"].as_str() {
+        Some("timed_out") => (tr("The sign-in window was open too long, so it was closed. What it had saved is kept."), true),
+        Some("cancelled") => (tr("Stopped waiting for the sign-in window. What it had saved is kept."), false),
+        _ if check["sign_in_page"].as_bool() == Some(true) => {
+            (tr("Your sign-in was saved, but the site still asks you to sign in. Sign in again and choose \"remember me\" if the site offers it."), true)
+        }
+        _ if check["done"].as_bool() != Some(true) => (tr("Your sign-in was saved, but opening the site again to check it didn't work."), true),
+        // No password field after the window closed doesn't prove a sign-in (a public page, a
+        // passwordless flow): say what happened, not what it may mean.
+        _ => (tr("The sign-in window was closed. Studies of this site will use what it saved."), false),
+    }
+}
+
+/// The site a `web_site_sign_in` call was for, as the person typed it (without `https://`), less
+/// any credentials, query or fragment: it's shown in a toast.
+pub fn site_name(params: &serde_json::Value) -> String {
+    let url = web_common::sanitize_url(params["url"].as_str().unwrap_or_default());
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    let host = url.split_once("://").map_or(url, |(_, rest)| rest);
+    host.strip_suffix('/').unwrap_or(host).to_string()
 }
 
 /// Clean room or Deep for what is recreated: the title bar's switch, as a plain choice.
@@ -581,6 +667,17 @@ pub fn project_icon(m: &craft_anything_engine::workspace::Manifest) -> &'static 
 mod tests {
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn no_update_installs_while_a_sign_in_window_is_open() {
+        let mut app = crate::demo::app(crate::demo::engine(craft_anything_engine::Mode::Beginner, true));
+        assert!(app.safe_to_install());
+        app.signing_in = Some(1);
+        assert!(!app.safe_to_install(), "installing closes the app before the sign-in is saved");
+        app.signing_in = None;
+        assert!(app.safe_to_install(), "and is fine again once it ends");
+    }
+
     #[test]
     fn web_addresses_are_checked_inline() {
         for ok in ["", "example.com", "https://a.b/c?d", "http://localhost:5173", "sub.example.co.uk/page"] {
@@ -610,6 +707,37 @@ mod tests {
         assert!(is_game(&kinds, &own(None, "Fix my game")), "nothing read from the folder: the words decide");
         let start_from = MakeDraft { existing: Some(ExistingFiles::StartFrom), ..own(Some("Python"), "Fix my game") };
         assert!(is_game(&kinds, &start_from), "material to start from doesn't decide");
+    }
+
+    #[test]
+    fn a_closed_sign_in_window_says_what_was_kept() {
+        use serde_json::json;
+        let checked = |sign_in_page: bool| json!({"done": true, "sign_in_page": sign_in_page, "error": null});
+        let words = |ended: &str, check: serde_json::Value| sign_in_words(&json!({"saved": true, "ended": ended, "check": check}));
+        assert_eq!(words("closed", checked(false)), ("The sign-in window was closed. Studies of this site will use what it saved.".to_string(), false));
+        let (still_asks, warn) = words("closed", checked(true));
+        assert!(warn && still_asks.contains("still asks you to sign in"), "{still_asks}");
+        let (unchecked, warn) = words("closed", json!({"done": false, "sign_in_page": null, "error": "the browser closed"}));
+        assert!(warn && unchecked.contains("didn't work"), "{unchecked}");
+        let (late, warn) = words("timed_out", checked(false));
+        assert!(warn && late.contains("open too long"), "{late}");
+        let (stopped, warn) = words("cancelled", checked(false));
+        assert!(!warn && stopped.starts_with("Stopped waiting"), "{stopped}");
+        // A result without a check (an older or a changed tool) isn't taken for a good sign-in.
+        assert!(sign_in_words(&json!({"saved": true})).1);
+    }
+
+    #[test]
+    fn a_sign_in_names_the_site_as_typed() {
+        use serde_json::json;
+        assert_eq!(site_name(&json!({"url": "https://example.com"})), "example.com");
+        assert_eq!(site_name(&json!({"url": "https://example.com/"})), "example.com");
+        assert_eq!(site_name(&json!({"url": "http://example.com:8080/app"})), "example.com:8080/app");
+        assert_eq!(site_name(&json!({})), "");
+        // A toast never shows credentials, a query or a fragment.
+        assert_eq!(site_name(&json!({"url": "https://alice:pw@example.com/app?token=abc#k"})), "example.com/app");
+        assert_eq!(site_name(&json!({"url": "https://example.com/?token=abc"})), "example.com");
+        assert_eq!(site_name(&json!({"url": "https://example.com/@profile"})), "example.com/@profile");
     }
 
     #[test]

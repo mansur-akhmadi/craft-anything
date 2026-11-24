@@ -562,24 +562,76 @@ pub struct PluginForm {
     pub id: String,
     /// A command (a local server), an https:// address (a remote one) or a `.wasm` file.
     pub place: String,
-    /// Arguments for a command, separated by spaces.
+    /// Arguments for a command, separated by spaces, or a JSON array of strings as other
+    /// clients' configuration files write them (the only way to give an argument with a space).
     pub args: String,
 }
 
+/// What a plugin's arguments field holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginArgs {
+    /// Arguments separated by spaces.
+    Words(Vec<String>),
+    /// A JSON array of strings, as other clients' configuration files write them.
+    List(Vec<String>),
+    /// Text in square brackets that isn't a JSON array of strings (`[1, 2]`, a trailing comma):
+    /// meant as a list, so it's refused rather than split on spaces (#2153).
+    BadList,
+}
+
+/// Reads a plugin's arguments field: text in square brackets is a JSON list, anything else is
+/// split on spaces.
+pub fn plugin_args(text: &str) -> PluginArgs {
+    let text = text.trim();
+    if text.starts_with('[') && text.ends_with(']') {
+        match serde_json::from_str::<Vec<String>>(text) {
+            Ok(list) => PluginArgs::List(list),
+            Err(_) => PluginArgs::BadList,
+        }
+    } else {
+        PluginArgs::Words(text.split_whitespace().map(str::to_owned).collect())
+    }
+}
+
 impl PluginForm {
-    /// The plugins_add params, or None while it's incomplete.
+    /// Whether the place is a command, the only kind that takes arguments.
+    fn is_command(&self) -> bool {
+        let place = self.place.trim();
+        !(place.starts_with("https://") || place.starts_with("http://") || place.to_ascii_lowercase().ends_with(".wasm"))
+    }
+
+    /// Whether the arguments are in square brackets but aren't a list of quoted words, so the
+    /// form can't be added until they're fixed.
+    pub fn args_refused(&self) -> bool {
+        self.is_command() && plugin_args(&self.args) == PluginArgs::BadList
+    }
+
+    /// The plugins_test params: those of plugins_add for an MCP server (a .wasm file has no
+    /// server to start).
+    pub fn test_params(&self) -> Option<serde_json::Value> {
+        self.params().filter(|p| p.get("wasm").is_none())
+    }
+
+    /// The plugins_add params, or None while it's incomplete or its arguments are refused.
     pub fn params(&self) -> Option<serde_json::Value> {
         let (id, place) = (self.id.trim(), self.place.trim());
         if id.is_empty() || place.is_empty() {
             return None;
         }
-        Some(if place.starts_with("https://") || place.starts_with("http://") {
-            serde_json::json!({"id": id, "url": place})
-        } else if place.to_ascii_lowercase().ends_with(".wasm") {
-            serde_json::json!({"id": id, "wasm": place})
-        } else {
-            serde_json::json!({"id": id, "command": place, "args": self.args.split_whitespace().collect::<Vec<_>>()})
-        })
+        if !self.is_command() {
+            return Some(if place.starts_with("https://") || place.starts_with("http://") {
+                serde_json::json!({"id": id, "url": place})
+            } else {
+                serde_json::json!({"id": id, "wasm": place})
+            });
+        }
+        // A pasted JSON array is the arguments as written; split on spaces it would leave
+        // brackets, quotes and commas in them (#2153).
+        let args = match plugin_args(&self.args) {
+            PluginArgs::Words(args) | PluginArgs::List(args) => args,
+            PluginArgs::BadList => return None,
+        };
+        Some(serde_json::json!({"id": id, "command": place, "args": args}))
     }
 }
 
@@ -649,8 +701,53 @@ mod tests {
         assert_eq!(f("docs", " https://mcp.example.com/mcp ", "ignored"), Some(serde_json::json!({"id": "docs", "url": "https://mcp.example.com/mcp"})));
         assert_eq!(f("fs", "npx", "-y  @scope/server  /tmp"), Some(serde_json::json!({"id": "fs", "command": "npx", "args": ["-y", "@scope/server", "/tmp"]})));
         assert_eq!(f("words", r"C:\plugins\Words.WASM", "ignored"), Some(serde_json::json!({"id": "words", "wasm": r"C:\plugins\Words.WASM"})));
+        // #2153: a JSON array pasted from another client's configuration is the arguments, spaces
+        // and backslashes included; anything else that starts with a bracket is split as before.
+        assert_eq!(
+            f("ls", "server", r#" ["--stdio", "--workspace", "C:\\my project"] "#),
+            Some(serde_json::json!({"id": "ls", "command": "server", "args": ["--stdio", "--workspace", r"C:\my project"]}))
+        );
+        assert_eq!(f("ls", "server", "[]"), Some(serde_json::json!({"id": "ls", "command": "server", "args": []})));
+        assert_eq!(f("ls", "server", "[1, 2] --x"), Some(serde_json::json!({"id": "ls", "command": "server", "args": ["[1,", "2]", "--x"]})));
         assert_eq!(f("", "npx", ""), None);
         assert_eq!(f("x", "  ", ""), None);
+    }
+
+    #[test]
+    fn only_a_plugin_server_is_tested() {
+        let form = |place: &str| PluginForm { id: "docs".into(), place: place.into(), args: String::new() };
+        assert_eq!(form("npx").test_params(), form("npx").params());
+        assert!(form("https://mcp.example.com/mcp").test_params().is_some());
+        assert_eq!(form("/plugins/words.wasm").test_params(), None);
+        assert_eq!(form("").test_params(), None);
+    }
+
+    #[test]
+    fn bracketed_plugin_arguments_that_arent_a_list_of_quoted_words_are_refused() {
+        let form = |place: &str, args: &str| PluginForm { id: "ls".into(), place: place.into(), args: args.into() };
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(plugin_args(r#" ["--port", "8080"] "#), PluginArgs::List(words(&["--port", "8080"])));
+        assert_eq!(plugin_args("[]"), PluginArgs::List(Vec::new()));
+        assert_eq!(plugin_args(" -y  @scope/server "), PluginArgs::Words(words(&["-y", "@scope/server"])));
+        assert_eq!(plugin_args(""), PluginArgs::Words(Vec::new()));
+        // Doesn't end with a bracket, so it isn't meant as a list: split as before.
+        assert_eq!(plugin_args("[1, 2] --x"), PluginArgs::Words(words(&["[1,", "2]", "--x"])));
+        assert_eq!(plugin_args("--x [1]"), PluginArgs::Words(words(&["--x", "[1]"])));
+        for bad in ["[1, 2]", r#"["a", "b",]"#, r#"[["a"]]"#, r#"["a" "b"]"#, "[--stdio]", "[ ]x]", r#"["a", null]"#] {
+            assert_eq!(plugin_args(bad), PluginArgs::BadList, "{bad}");
+            let f = form("server", bad);
+            assert!(f.args_refused(), "{bad}");
+            assert_eq!(f.params(), None, "a bad list is never saved: {bad}");
+        }
+        // Addresses and .wasm files take no arguments, so what's in the field doesn't stop them.
+        for place in ["https://mcp.example.com/mcp", r"C:\plugins\words.wasm"] {
+            let f = form(place, "[1, 2]");
+            assert!(!f.args_refused(), "{place}");
+            assert!(f.params().is_some(), "{place}");
+        }
+        assert_eq!(form("https://mcp.example.com/a.wasm", "").params(), Some(serde_json::json!({"id": "ls", "url": "https://mcp.example.com/a.wasm"})));
+        // Fixed, the same form is added.
+        assert_eq!(form("server", r#"["a", "b"]"#).params(), Some(serde_json::json!({"id": "ls", "command": "server", "args": ["a", "b"]})));
     }
 
     #[test]

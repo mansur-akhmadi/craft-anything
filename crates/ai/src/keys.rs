@@ -42,13 +42,14 @@ pub fn asset_keys(store: &KeyStore, providers: &AssetProviders) -> AssetKeys {
     )
 }
 
-/// After a key changed: keys a run already loaded into `session` follow, so a removed one stops being
-/// spent at once. A session with none loaded stays that way. Reads the keychain, so call it off the UI
-/// thread; a tool passes the session it holds, because locking it again would wait forever.
-pub fn refresh_loaded(session: &mut craft_anything_engine::Session, store: &KeyStore) {
-    if session.ext.get::<AssetKeys>().is_some() {
+/// After a key changed: keys a run already loaded follow, in `session` (`engine`'s) at once and in
+/// every engine beside it at its next tool call, so a removed one stops being spent. With none
+/// loaded, none appear. Reads the keychain, so call it off the UI thread; a tool passes the session
+/// it holds, because locking it again would wait forever.
+pub fn refresh_loaded(session: &mut craft_anything_engine::Session, engine: &craft_anything_engine::Engine, store: &KeyStore) {
+    if session.ext.get::<AssetKeys>().is_some() || engine.asset_keys_loaded() {
         let providers = session.ext.get::<AssetProviders>().map(|p| p.as_ref().clone()).unwrap_or_default();
-        session.ext.insert(std::sync::Arc::new(asset_keys(store, &providers)));
+        engine.load_asset_keys(session, || asset_keys(store, &providers));
     }
 }
 
@@ -95,18 +96,26 @@ enum KeychainGet {
 pub struct KeyStore {
     file: PathBuf,
     use_keychain: bool,
+    use_env: bool,
 }
 
 impl KeyStore {
     /// The default store: keychain + `<config dir>/ai-keys.toml`.
     pub fn system() -> Self {
         let no_chain = std::env::var(NO_KEYCHAIN_ENV).is_ok_and(|v| v == "1");
-        KeyStore { file: craft_anything_engine::settings::config_dir().join("ai-keys.toml"), use_keychain: !no_chain }
+        KeyStore { file: craft_anything_engine::settings::config_dir().join("ai-keys.toml"), use_keychain: !no_chain, use_env: true }
     }
 
     /// A file-only store (tests).
     pub fn file_only(file: PathBuf) -> Self {
-        KeyStore { file, use_keychain: false }
+        KeyStore { file, use_keychain: false, use_env: true }
+    }
+
+    /// A file-only store that also ignores the environment, so a test that needs a backend to
+    /// have no key doesn't depend on the machine's variables.
+    #[cfg(test)]
+    pub(crate) fn file_only_without_env(file: PathBuf) -> Self {
+        KeyStore { file, use_keychain: false, use_env: false }
     }
 
     fn read_file(&self) -> toml::Table {
@@ -145,9 +154,16 @@ impl KeyStore {
         self.read_file().get(backend).and_then(|v| v.as_str()).map(str::to_string).filter(|k| !k.is_empty())
     }
 
-    /// The key to use: stored, else the kind's environment variable.
+    /// The key to use: stored, else the kind's environment variable (when this store reads it).
     pub fn resolve(&self, backend: &str, kind: BackendKind) -> Option<String> {
-        self.get(backend).or_else(|| env_var(kind).and_then(|v| std::env::var(v).ok()).filter(|k| !k.trim().is_empty()))
+        self.resolve_with(backend, kind, |v| std::env::var(v).ok())
+    }
+
+    /// [`Self::resolve`] using a caller-supplied environment lookup so tests can verify precedence
+    /// without mutating process environment variables.
+    pub fn resolve_with(&self, backend: &str, kind: BackendKind, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+        let from_env = self.use_env.then(|| env_var(kind).and_then(env).filter(|k| !k.trim().is_empty())).flatten();
+        self.get(backend).or(from_env)
     }
 
     /// Save a key. Returns where it went: `"keychain"` or `"file"`.
@@ -404,16 +420,17 @@ mod tests {
         let mut providers = AssetProviders::built_in();
         providers.register(std::sync::Arc::new(Other));
         s.set(&asset_key_name("other"), "o-1").unwrap();
-        let mut session = craft_anything_engine::testing::session();
+        let engine = craft_anything_engine::Engine::new(craft_anything_engine::testing::session());
+        let mut session = engine.session();
         session.ext.insert(std::sync::Arc::new(providers));
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert!(session.ext.get::<AssetKeys>().is_none(), "no run loaded any");
 
         session.ext.insert(std::sync::Arc::new(AssetKeys([("other".to_string(), "old".to_string())].into())));
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), Some("o-1"), "a changed key");
         s.delete(&asset_key_name("other")).unwrap();
-        refresh_loaded(&mut session, &s);
+        refresh_loaded(&mut session, &engine, &s);
         assert_eq!(session.ext.get::<AssetKeys>().unwrap().get("other"), None, "a removed key");
     }
 
@@ -484,5 +501,24 @@ mod tests {
         assert!(s.set("x", " ").is_err());
         assert_eq!(env_var(BackendKind::Openrouter), Some("OPENROUTER_API_KEY"));
         assert_eq!(env_var(BackendKind::Gemini), Some("GEMINI_API_KEY"));
+    }
+
+    /// #1358: a saved key takes precedence over an environment variable, blank env values are
+    /// ignored, and `use_env = false` skips the environment lookup.
+    #[test]
+    fn resolve_with_prefers_stored_key_over_environment_and_ignores_blank_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ai-keys.toml");
+        let store = KeyStore::file_only(file.clone());
+        let env = |v: &str| (v == "OPENAI_API_KEY").then(|| "sk-env-old".to_string());
+        assert_eq!(store.resolve_with("OpenAI", BackendKind::Openai, env).as_deref(), Some("sk-env-old"));
+        assert_eq!(store.resolve_with("OpenAI", BackendKind::Openai, |_| Some("   ".into())), None);
+
+        store.set("OpenAI", "sk-pasted-new").unwrap();
+        assert_eq!(store.resolve_with("OpenAI", BackendKind::Openai, env).as_deref(), Some("sk-pasted-new"));
+
+        let no_env = KeyStore::file_only_without_env(file);
+        assert_eq!(no_env.resolve_with("OpenAI", BackendKind::Openai, env).as_deref(), Some("sk-pasted-new"));
+        assert_eq!(no_env.resolve_with("Other", BackendKind::Openai, env), None);
     }
 }

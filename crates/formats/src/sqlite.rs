@@ -267,18 +267,12 @@ struct BtreePage<'a> {
     header: usize,
     kind: u8,
     cells: usize,
-    pointers: usize,
-    pointers_end: usize,
+    btree: craft_sqlite::BtreePageHeader,
 }
 
 impl BtreePage<'_> {
     fn cell_offset(&self, index: usize) -> Option<usize> {
-        if index >= self.cells {
-            return None;
-        }
-        let pointer = self.pointers.checked_add(index.checked_mul(2)?)?;
-        let offset = usize::from(read_u16_be(self.data, pointer)?);
-        (offset >= self.pointers_end && offset < self.data.len()).then_some(offset)
+        craft_sqlite::btree_cell_offset(self.data, &self.btree, index).ok()
     }
 }
 
@@ -299,21 +293,7 @@ fn read_u16_be(data: &[u8], off: usize) -> Option<u16> {
 
 /// A SQLite big-endian varint (up to 9 bytes): (value, bytes consumed).
 fn varint(data: &[u8], off: usize) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut i = 0usize;
-    while i < 9 {
-        let b = *data.get(off.checked_add(i)?)?;
-        if i == 8 {
-            result = (result << 8) | u64::from(b);
-            return Some((result, 9));
-        }
-        result = (result << 7) | u64::from(b & 0x7f);
-        if b & 0x80 == 0 {
-            return Some((result, i + 1));
-        }
-        i += 1;
-    }
-    None
+    craft_sqlite::read_varint(data.get(off..)?).ok()
 }
 
 fn version_string(n: u32) -> String {
@@ -337,17 +317,17 @@ impl<'a> SqliteDb<'a> {
             return Err(FormatError::Truncated("the 100-byte header does not fit".into()));
         }
         let raw_ps = read_u16_be(data, 16).unwrap_or(0);
-        let page_size: u32 = if raw_ps == 1 { 65_536 } else { u32::from(raw_ps) };
-        if page_size < 512 || !page_size.is_power_of_two() {
-            return Err(FormatError::Malformed(format!("page size {page_size} is not a power of two in 512..=65536")));
-        }
+        let page_size = craft_sqlite::page_size_from_raw(raw_ps).map_err(|err| match err {
+            craft_sqlite::Error::InvalidPageSize(size) => FormatError::Malformed(format!("page size {size} is not a power of two in 512..=65536")),
+            _ => FormatError::Malformed("invalid SQLite page size".into()),
+        })?;
         let write_version = *data.get(18).unwrap_or(&0);
         let read_version = *data.get(19).unwrap_or(&0);
         let reserved_space = *data.get(20).unwrap_or(&0);
-        let usable = (page_size as usize).saturating_sub(reserved_space as usize);
-        if usable < 480 {
-            return Err(FormatError::Malformed(format!("usable page size {usable} is too small")));
-        }
+        let usable = craft_sqlite::usable_page_size(page_size, reserved_space).map_err(|err| match err {
+            craft_sqlite::Error::UsablePageSizeTooSmall(usable) => FormatError::Malformed(format!("usable page size {usable} is too small")),
+            _ => FormatError::Malformed("invalid usable page size".into()),
+        })? as usize;
         let text_encoding = match read_u32_be(data, 56).unwrap_or(0) {
             1 => "utf-8",
             2 => "utf-16le",
@@ -410,18 +390,8 @@ impl<'a> SqliteDb<'a> {
         let base = self.page_base(pageno)?;
         let end = base.checked_add(self.usable)?.min(self.data.len());
         let data = self.data.get(base..end)?;
-        let header: usize = if pageno == 1 { 100 } else { 0 };
-        let kind = *data.get(header)?;
-        let header_size = match kind {
-            0x05 | 0x02 => 12,
-            0x0d | 0x0a => 8,
-            _ => return None,
-        };
-        let cells = usize::from(read_u16_be(data, header.checked_add(3)?)?);
-        let pointers = header.checked_add(header_size)?;
-        let pointers_end = pointers.checked_add(cells.checked_mul(2)?)?;
-        data.get(header..pointers_end)?;
-        Some(BtreePage { data, header, kind, cells, pointers, pointers_end })
+        let btree = craft_sqlite::parse_btree_page_header(data, pageno == 1).ok()?;
+        Some(BtreePage { data, header: btree.header_offset, kind: btree.kind, cells: btree.cells, btree })
     }
 
     /// Build the whole-database overview, including the schema.
@@ -455,8 +425,8 @@ impl<'a> SqliteDb<'a> {
 
     /// Walk the `sqlite_schema` b-tree (rooted at page 1) and return its objects. Columns are
     /// parsed from the whole CREATE statement; the text shown is cut at [`MAX_TEXT`] bytes. The
-    /// flag is true when the list may be incomplete (the object cap was hit, or part of the b-tree
-    /// couldn't be read), and the notes say what the walk skipped or cut.
+    /// flag is true when the list or an object's metadata may be incomplete (an object or text
+    /// cap was hit, or part of the b-tree or a record couldn't be read). Notes say what was cut.
     pub fn schema(&self) -> (Vec<SchemaObject>, bool, Vec<String>) {
         let (mut objects, truncated, notes) = self.whole_schema();
         for object in &mut objects {
@@ -475,7 +445,21 @@ impl<'a> SqliteDb<'a> {
         w.text_cap = MAX_SCHEMA_TEXT;
         w.text_budget = MAX_SCHEMA_TEXT_TOTAL;
         self.collect_table_rows(&mut w, 1, 0);
-        let truncated = w.incomplete || w.out.len() >= MAX_SCHEMA_OBJECTS;
+        let partial = w
+            .out
+            .iter()
+            .filter(|row| {
+                row.values.len() < 5
+                    || row
+                        .values
+                        .iter()
+                        .any(|value| matches!(value, CellValue::NotRead | CellValue::Text { truncated: true, .. } | CellValue::PartialBlob { .. }))
+            })
+            .count();
+        let truncated = w.incomplete || w.out.len() >= MAX_SCHEMA_OBJECTS || partial > 0;
+        if partial > 0 {
+            w.notes.push(format!("{partial} schema record(s) were read only partially; object metadata or column lists may be incomplete."));
+        }
         for row in w.out {
             // sqlite_schema columns: type, name, tbl_name, rootpage, sql.
             let get_text = |i: usize| match row.values.get(i) {
@@ -780,17 +764,8 @@ impl<'a> SqliteDb<'a> {
     /// Assemble a cell payload: the local part plus any overflow-page chain, capped.
     fn assemble_payload(&self, page: &[u8], local_off: usize, payload_len: usize, is_table_leaf: bool, notes: &mut Vec<String>) -> Option<Vec<u8>> {
         let usable = self.usable;
-        // Maximum bytes stored on the page before spilling to overflow.
-        let x = if is_table_leaf { usable.saturating_sub(35) } else { ((usable.saturating_sub(12)) * 64 / 255).saturating_sub(23) };
-        let local = if payload_len <= x {
-            payload_len
-        } else {
-            let m = ((usable.saturating_sub(12)) * 32 / 255).saturating_sub(23);
-            let surplus = payload_len.saturating_sub(m);
-            let denom = usable.saturating_sub(4).max(1);
-            let k = m.saturating_add(surplus % denom);
-            if k <= x { k } else { m }
-        };
+        let kind = if is_table_leaf { craft_sqlite::PayloadKind::TableLeaf } else { craft_sqlite::PayloadKind::Index };
+        let local = craft_sqlite::local_payload_len(u32::try_from(usable).ok()?, payload_len as u64, kind)? as usize;
         let mut out = Vec::new();
         let first = page.get(local_off..local_off.checked_add(local)?)?;
         out.extend_from_slice(first);
@@ -830,44 +805,27 @@ impl<'a> SqliteDb<'a> {
 
 /// Decode a SQLite record (the "payload") into column values, cutting text at `text_cap` bytes.
 fn parse_record(payload: &[u8], text_encoding: &str, text_cap: usize) -> Vec<CellValue> {
+    let Ok((header, body)) = craft_sqlite::split_record(payload) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    let Some((hdr_len, n)) = varint(payload, 0) else { return out };
-    let hdr_len = hdr_len as usize;
-    if hdr_len > payload.len() || hdr_len < n {
-        return out;
-    }
-    // First read the serial types from the header region.
-    let mut types = Vec::new();
-    let mut p = n;
-    while p < hdr_len {
-        let Some((st, used)) = varint(payload, p) else { break };
-        types.push(st);
-        p = match p.checked_add(used) {
-            Some(v) => v,
-            None => break,
-        };
-        if types.len() >= MAX_COLUMNS {
-            break;
-        }
-    }
-    // Then read each value from the body region.
-    let mut body = hdr_len;
-    for st in types {
-        let (val, size) = decode_serial(st, payload, body, text_encoding, text_cap);
+    let mut header_offset = 0;
+    let mut body_offset = 0;
+    while out.len() < MAX_COLUMNS {
+        let Some((serial, used)) = varint(header, header_offset) else { break };
+        let (val, size) = decode_serial(serial, body, body_offset, text_encoding, text_cap);
         out.push(val);
-        body = body.saturating_add(size);
+        header_offset += used;
+        body_offset = body_offset.saturating_add(size);
     }
     out
 }
 
 /// Decode one serial-typed value at `off`; returns the value and its byte size.
 fn decode_serial(serial: u64, data: &[u8], off: usize, text_encoding: &str, text_cap: usize) -> (CellValue, usize) {
-    let size = match serial {
-        1..=4 => serial as usize,
-        5 => 6,
-        6 | 7 => 8,
-        n if n >= 12 => usize::try_from((n - 12) / 2).unwrap_or(usize::MAX),
-        _ => 0,
+    let size = match craft_sqlite::serial_type_len(serial) {
+        Ok(len) => usize::try_from(len).unwrap_or(usize::MAX),
+        Err(_) => 0,
     };
     if off > data.len() || (off == data.len() && size != 0) {
         return (CellValue::NotRead, size);
@@ -913,11 +871,7 @@ fn decode_serial(serial: u64, data: &[u8], off: usize, text_encoding: &str, text
 
 fn int_be(data: &[u8], off: usize, len: usize) -> CellValue {
     let Some(slice) = data.get(off..off.saturating_add(len)) else { return CellValue::Null };
-    let mut v: i64 = if slice.first().is_some_and(|b| b & 0x80 != 0) { -1 } else { 0 };
-    for &b in slice {
-        v = (v << 8) | i64::from(b);
-    }
-    CellValue::Int(v)
+    craft_sqlite::decode_signed_be_int(slice).map(CellValue::Int).unwrap_or(CellValue::Null)
 }
 
 fn text_value(slice: &[u8]) -> CellValue {
@@ -1957,6 +1911,17 @@ fn starts_column_constraint(token: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_serial_type_cannot_continue_into_the_record_body() {
+        let complete = [3, 1, 9, 9];
+        assert_eq!(parse_record(&complete, "utf-8", MAX_TEXT), [CellValue::Int(9), CellValue::Int(1)]);
+
+        // The first body's integer would complete the unfinished second serial
+        // type as 9 if the parser read past the declared header.
+        let truncated = [3, 1, 0x80, 9];
+        assert_eq!(parse_record(&truncated, "utf-8", MAX_TEXT), [CellValue::Int(9)]);
+    }
+
     /// A TEXT value cut inside a character drops the incomplete character, not a U+FFFD that
     /// wasn't in the database.
     #[test]
@@ -2258,8 +2223,11 @@ mod tests {
         assert_eq!(varint(&[0x00], 0), Some((0, 1)));
         assert_eq!(varint(&[0x7f], 0), Some((127, 1)));
         assert_eq!(varint(&[0x81, 0x00], 0), Some((128, 2)));
-        assert_eq!(varint(&[0xff; 9], 0).map(|(_, n)| n), Some(9));
+        assert_eq!(varint(&[0xff; 9], 0), Some((u64::MAX, 9)));
+        assert_eq!(varint(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01], 0), Some((1, 9)));
+        assert_eq!(varint(&[0x80; 8], 0), None);
         assert_eq!(varint(&[0x80], 0), None); // never terminates within range
+        assert_eq!(varint(&[], 1), None);
     }
 
     #[test]
@@ -2409,6 +2377,63 @@ mod tests {
             assert_eq!(shown, bad.min(MAX_SCHEMA_NOTES), "{:?}", ov.integrity_notes);
             assert_eq!(ov.integrity_notes.iter().any(|n| n.ends_with("5 more note(s) not shown.")), bad > MAX_SCHEMA_NOTES);
         }
+    }
+
+    #[test]
+    fn partial_schema_overflow_is_disclosed_without_dropping_the_object() {
+        use craft_anything_testkit::sqlite::{PAGE_SIZE, table_db};
+        let sql = format!("CREATE TABLE t(first TEXT /*{}*/, last TEXT)", "x".repeat(12_000));
+        let intact = table_db(&sql, &[]);
+        let complete = SqliteDb::parse(&intact).unwrap().overview();
+        assert!(!complete.schema_truncated);
+        assert_eq!(complete.schema[0].columns.len(), 2);
+        assert!(complete.schema[0].sql.len() < sql.len(), "display-only shortening is not incomplete parsing");
+
+        for next in [0, 3, u32::MAX] {
+            let mut data = intact.clone();
+            // Page 3 is the first schema overflow page: end early, loop, or leave the file.
+            data[2 * PAGE_SIZE..2 * PAGE_SIZE + 4].copy_from_slice(&next.to_be_bytes());
+            let parsed = SqliteDb::parse(&data).unwrap();
+            let overview = parsed.overview();
+            assert_eq!(overview.schema.len(), 1);
+            assert_eq!(overview.schema[0].name, "t");
+            assert!(overview.schema[0].columns.len() < complete.schema[0].columns.len());
+            assert!(overview.schema_truncated, "overflow next page {next}");
+            assert!(parsed.schema().1);
+            assert!(overview.integrity_notes.iter().any(|note| note.contains("schema record")));
+        }
+    }
+
+    #[test]
+    fn schema_text_caps_are_reported_before_display_shortening() {
+        use craft_anything_testkit::sqlite::table_db;
+        let sql = format!("CREATE TABLE t(first TEXT /*{}*/, last TEXT)", "x".repeat(MAX_SCHEMA_TEXT));
+        let data = table_db(&sql, &[]);
+        let overview = SqliteDb::parse(&data).unwrap().overview();
+        assert_eq!(overview.schema.len(), 1);
+        assert!(overview.schema_truncated);
+        assert!(overview.integrity_notes.iter().any(|note| note.contains("schema record")));
+    }
+
+    #[test]
+    fn exhausted_schema_text_budget_marks_later_objects_partial() {
+        use craft_anything_testkit::sqlite::table_db;
+        let sql = format!("CREATE TABLE t(first TEXT /*{}*/, last TEXT)", "x".repeat(MAX_SCHEMA_TEXT - 100));
+        let mut data = table_db(&sql, &[]);
+        let copies = MAX_SCHEMA_TEXT_TOTAL / sql.len() + 2;
+        let pointer = [data[108], data[109]];
+        assert!(108 + 2 * copies < usize::from(u16::from_be_bytes(pointer)));
+        data[103..105].copy_from_slice(&(copies as u16).to_be_bytes());
+        // Repeated cells sharing one overflow chain exercise the real aggregate text budget.
+        for index in 0..copies {
+            data[108 + 2 * index..110 + 2 * index].copy_from_slice(&pointer);
+        }
+        let overview = SqliteDb::parse(&data).unwrap().overview();
+        assert_eq!(overview.schema.len(), copies);
+        assert_eq!(overview.schema[0].columns.len(), 2);
+        assert!(overview.schema.last().unwrap().columns.len() < 2);
+        assert!(overview.schema_truncated);
+        assert!(overview.integrity_notes.iter().any(|note| note.contains("schema record")));
     }
 
     #[test]
@@ -2596,6 +2621,14 @@ mod tests {
             CellValue::Blob { len, .. } => assert_eq!(len, 3),
             other => panic!("expected blob, got {other:?}"),
         }
+        // 6-byte signed integer, 8-byte signed integer, 8-byte float, and reserved serial types 10/11.
+        assert_eq!(decode_serial(5, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xfe], 0, "utf-8", MAX_TEXT), (CellValue::Int(-2), 6));
+        assert_eq!(decode_serial(6, &(-42_i64).to_be_bytes(), 0, "utf-8", MAX_TEXT), (CellValue::Int(-42), 8));
+        assert_eq!(decode_serial(7, &3.5_f64.to_be_bytes(), 0, "utf-8", MAX_TEXT), (CellValue::Real(3.5), 8));
+        assert_eq!(decode_serial(10, &[], 0, "utf-8", MAX_TEXT), (CellValue::Null, 0));
+        assert_eq!(decode_serial(11, &[], 0, "utf-8", MAX_TEXT), (CellValue::Null, 0));
+        assert_eq!(craft_sqlite::serial_type_len(10), Err(craft_sqlite::Error::ReservedSerialType(10)));
+        assert_eq!(craft_sqlite::serial_type_len(11), Err(craft_sqlite::Error::ReservedSerialType(11)));
     }
 
     fn text(value: &str) -> CellValue {

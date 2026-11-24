@@ -48,6 +48,7 @@ impl<'ast> Visit<'ast> for Lookups {
                 ("widgets", "choice_tile" | "big_card") => &[3, 4],
                 ("widgets", "empty_state") => &[2, 3],
                 ("icons", "button") => &[4],
+                ("Button", "new") => &[1],
                 _ => &[],
             };
             for &i in positions {
@@ -96,8 +97,8 @@ pub fn check(root: &Path) -> bool {
     };
     let mut catalogs = Vec::new();
     for code in ["zh-hans", "zh-hant", "ru", "ko", "cs", "de", "ka", "es", "it", "vi", "pt-br", "tr", "th", "et"] {
-        let path = source.join("i18n").join(format!("{code}.tsv"));
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let path = source.join("i18n").join(code);
+        let Some(text) = catalog_text(&path) else {
             eprintln!("i18n: can't read {}", path.display());
             return false;
         };
@@ -111,6 +112,20 @@ pub fn check(root: &Path) -> bool {
         println!("{line}");
     }
     report.problems.is_empty()
+}
+
+/// A language's catalog files (`i18n/<code>/*.tsv`), joined in name order as `build.rs` joins them.
+fn catalog_text(dir: &Path) -> Option<String> {
+    // An entry that can't be read fails the check rather than leaving a file out.
+    let mut files = std::fs::read_dir(dir).ok()?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<Vec<_>>>().ok()?;
+    files.retain(|p| p.extension().is_some_and(|x| x == "tsv"));
+    files.sort();
+    let mut text = String::new();
+    for file in files {
+        text.push_str(&std::fs::read_to_string(file).ok()?);
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// The list of strings that may be missing from the catalogs for now, beside them in `i18n/`.
@@ -179,6 +194,7 @@ mod tests {
             fn screen() {
                 tr(if mode == "internal" { "Simple" } else { "Advanced" });
                 widgets::primary_icon(ui, Some("play"), "Start", true);
+                ui.add(widgets::Button::new(widgets::ButtonKind::Secondary, "Sign in").enabled(free));
                 icons::button(ui, "x", 20.0, false, "Close");
                 widgets::segmented(ui, &["One", "Two"], 0, 30.0);
                 widgets::named(resp, &trf("Open {name}", &[("name", "sample.exe")]));
@@ -189,7 +205,7 @@ mod tests {
         .unwrap();
         let mut lookups = Lookups::default();
         lookups.visit_file(&file);
-        assert_eq!(lookups.0.0, ["Advanced", "Close", "One", "Open {name}", "Simple", "Start", "Two"].into_iter().map(str::to_string).collect());
+        assert_eq!(lookups.0.0, ["Advanced", "Close", "One", "Open {name}", "Sign in", "Simple", "Start", "Two"].into_iter().map(str::to_string).collect());
     }
 
     fn set(keys: &[&str]) -> BTreeSet<String> {

@@ -21,6 +21,7 @@ use crate::inbox::{next_counter, now_ms};
 use crate::project::write_atomic;
 use crate::versioned::{self, upgrade};
 use craft_anything_evidence::{ErrorCode, ToolError};
+use craft_anything_platform::fs::read_file_capped;
 use craft_anything_platform::sync::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -79,11 +80,16 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool, depth: usize)
     Ok(())
 }
 
+/// Ghidra was stopped for this project's builds (`tools::deep::STOPPED`), and its lock file.
+pub const GHIDRA_STOPPED: &str = "ghidra-stopped";
+pub const GHIDRA_STOP_LOCK: &str = "ghidra-stop.lock";
+
 /// The current `craft.json` format version. Bumping it means appending a step to [`MANIFEST_STEPS`].
-pub const MANIFEST_VERSION: u32 = 5;
+pub const MANIFEST_VERSION: u32 = 6;
 
 /// The steps that bring an older `craft.json` forward; step `i` goes from version `i` to `i + 1`.
-const MANIFEST_STEPS: &[versioned::Step<Value>] = &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3, manifest_v3_to_v4, manifest_v4_to_v5];
+const MANIFEST_STEPS: &[versioned::Step<Value>] =
+    &[manifest_v0_to_v1, manifest_v1_to_v2, manifest_v2_to_v3, manifest_v3_to_v4, manifest_v4_to_v5, manifest_v5_to_v6];
 const _: () = assert!(MANIFEST_STEPS.len() == MANIFEST_VERSION as usize, "one step per craft.json version");
 
 /// Version 0 (no `version` field) has the same shape as version 1; only the number is new.
@@ -126,6 +132,13 @@ fn manifest_v4_to_v5(doc: &mut Value) -> Result<(), String> {
         obj.insert("capture_deep".into(), Value::Bool(true));
     }
     Ok(())
+}
+
+/// Version 6 adds the toolchain a move to another language was confirmed with (`toolchain`), none
+/// by default. The number is new so an older build, which would drop it when it saves (and a
+/// Java port's checks could go back to Maven), opens such a project read-only instead.
+fn manifest_v5_to_v6(doc: &mut Value) -> Result<(), String> {
+    if doc.is_object() { Ok(()) } else { Err("the manifest isn't a JSON object".into()) }
 }
 
 /// Read a `craft.json` document of any version this build understands. A newer manifest is read
@@ -401,6 +414,10 @@ pub struct Manifest {
     /// The stack chosen for the build ("React + TypeScript (Vite)", "Rust + Bevy"…).
     #[serde(default)]
     pub stack: String,
+    /// The toolchain a move to `stack` was confirmed with ("Gradle", for a Java port that wrote
+    /// build.gradle.kts beside an old pom.xml), when the stack has more than one; none: not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<String>,
     #[serde(default)]
     pub status: Status,
     /// One line on what's happening or what went wrong.
@@ -502,6 +519,7 @@ impl Manifest {
             checks: Vec::new(),
             agent_session: None,
             agent_session_by: None,
+            toolchain: None,
             agent_session_deep: None,
             capture_deep: None,
             allowed_actions: Vec::new(),
@@ -600,17 +618,53 @@ pub const USAGE_VERSION: u32 = 1;
 /// A build's turn and a question can record their cost at the same time. The save is
 /// read-modify-write, so both go through one lock or one would overwrite the other.
 static USAGE_UPDATE: Mutex<()> = Mutex::new(());
+/// A real usage.json is a few hundred bytes; anything this big isn't one.
+const MAX_USAGE_BYTES: u64 = 1024 * 1024;
 
-impl ProjectUsage {
-    /// The saved usage of the project at `root`; nothing yet (or unreadable) is all zeros.
-    pub fn load(root: &Path) -> ProjectUsage {
-        std::fs::read(root.join(USAGE_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+/// What reading a project's usage.json found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageRead {
+    /// There is no file: nothing has been used yet.
+    None,
+    Known(ProjectUsage),
+    /// The file is there but couldn't be read or understood, so what was used isn't known.
+    /// It is never shown as zero.
+    Unreadable,
+}
+
+impl UsageRead {
+    /// The usage as far as it's known: `None` when the file couldn't be read.
+    pub fn known(self) -> Option<ProjectUsage> {
+        match self {
+            UsageRead::None => Some(ProjectUsage::default()),
+            UsageRead::Known(u) => Some(u),
+            UsageRead::Unreadable => None,
+        }
     }
 
-    /// Change the saved usage (the run's job). A file from a newer Craft Anything is left alone.
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, UsageRead::Unreadable)
+    }
+}
+
+impl ProjectUsage {
+    /// Read the saved usage of the project at `root`. Only a missing file means nothing was used;
+    /// any other failure, or a file that doesn't parse, is [`UsageRead::Unreadable`].
+    pub fn read(root: &Path) -> UsageRead {
+        match read_file_capped(&root.join(USAGE_FILE), MAX_USAGE_BYTES) {
+            Err(e) if e.code == ErrorCode::NotFound => UsageRead::None,
+            Err(_) => UsageRead::Unreadable,
+            Ok(bytes) => serde_json::from_slice(&bytes).map_or(UsageRead::Unreadable, UsageRead::Known),
+        }
+    }
+
+    /// Change the saved usage (the run's job). A file from a newer Craft Anything, or one that
+    /// can't be read, is left alone: writing over it would lose what it counted.
     pub fn update(root: &Path, f: impl FnOnce(&mut ProjectUsage)) -> Result<(), ToolError> {
         let _updating = USAGE_UPDATE.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut u = ProjectUsage::load(root);
+        let Some(mut u) = ProjectUsage::read(root).known() else {
+            return Err(ToolError::invalid(format!("{USAGE_FILE} couldn't be read, so it isn't changed.")));
+        };
         if u.version > USAGE_VERSION {
             return Err(ToolError::unsupported(format!("{USAGE_FILE} was written by a newer Craft Anything, so it isn't changed.")));
         }
@@ -881,15 +935,27 @@ impl Workspace {
     }
 
     fn write_manifest(&self, m: &Manifest) -> Result<(), ToolError> {
-        if self.is_read_only() {
+        let newer = self.manifest.version.max(self.version_on_disk());
+        if newer > MANIFEST_VERSION {
             return Err(ToolError::unsupported(format!(
-                "{} was made by a newer Craft Anything (craft.json version {}), so this one doesn't change it.",
-                self.manifest.name, self.manifest.version
+                "{} was made by a newer Craft Anything (craft.json version {newer}), so this one doesn't change it.",
+                self.manifest.name
             ))
             .with_remediation("Update Craft Anything to keep working on this project. Nothing was written."));
         }
         let bytes = serde_json::to_vec_pretty(m).map_err(|e| ToolError::internal(e.to_string()))?;
         write_atomic(&self.root.join(MANIFEST), &bytes)
+    }
+
+    /// The version of the `craft.json` on disk now (0 when it can't be read). A newer build running
+    /// at the same time may have brought the file forward since this copy was read, and a save from
+    /// this copy would drop the fields it added (review of #2099).
+    fn version_on_disk(&self) -> u32 {
+        std::fs::read(self.root.join(MANIFEST))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .and_then(|d| d.get("version")?.as_u64())
+            .map_or(0, |v| u32::try_from(v).unwrap_or(u32::MAX))
     }
 
     /// Set the status and note, and save.
@@ -945,9 +1011,9 @@ impl Workspace {
         std::fs::read(self.root.join(ASSETS)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    /// What the builds have taken and used so far.
-    pub fn usage(&self) -> ProjectUsage {
-        ProjectUsage::load(&self.root)
+    /// What the builds have taken and used so far, or that it can't be known.
+    pub fn usage(&self) -> UsageRead {
+        ProjectUsage::read(&self.root)
     }
 
     /// What generated assets have cost so far.
@@ -1034,6 +1100,8 @@ pub const AGENT_SESSION_FILE: &str = "agent-session.jsonl";
 /// mustn't already have any of them.
 pub const OWN_NAMES: &[&str] = &[
     MANIFEST,
+    GHIDRA_STOPPED,
+    GHIDRA_STOP_LOCK,
     crate::feed::FEED_FILE,
     crate::questions::QUESTIONS_FILE,
     USAGE_FILE,
@@ -1533,7 +1601,7 @@ mod tests {
     #[test]
     fn a_projects_usage_adds_up_across_runs_and_a_newer_file_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(ProjectUsage::load(dir.path()), ProjectUsage::default(), "nothing yet");
+        assert_eq!(ProjectUsage::read(dir.path()), UsageRead::None, "nothing yet");
         for cost in [Some(1.25), None, Some(f64::NAN), Some(2.0)] {
             ProjectUsage::update(dir.path(), |u| {
                 u.work_ms += 1_000;
@@ -1541,11 +1609,60 @@ mod tests {
             })
             .unwrap();
         }
-        let u = ProjectUsage::load(dir.path());
+        let u = ProjectUsage::read(dir.path()).known().unwrap();
         assert_eq!((u.version, u.work_ms, u.tokens(), u.cost_usd, u.priced), (USAGE_VERSION, 4_000, 440, 3.25, true));
         std::fs::write(dir.path().join(USAGE_FILE), r#"{"version": 99, "work_ms": 5}"#).unwrap();
         assert!(ProjectUsage::update(dir.path(), |u| u.work_ms = 0).is_err());
-        assert_eq!(ProjectUsage::load(dir.path()).work_ms, 5, "read as far as it's known, never written over");
+        assert_eq!(ProjectUsage::read(dir.path()).known().unwrap().work_ms, 5, "read as far as it's known, never written over");
+    }
+
+    /// An unreadable usage.json is unknown, never zeros, and a run doesn't write over it.
+    #[test]
+    fn an_unreadable_usage_file_is_unknown_and_left_alone() {
+        let unreadable = |root: &Path, why: &str| {
+            assert_eq!(ProjectUsage::read(root), UsageRead::Unreadable, "{why}");
+            assert!(ProjectUsage::read(root).known().is_none(), "{why}");
+            assert!(ProjectUsage::update(root, |u| u.add_turn(1, 1, Some(1.0), false)).is_err(), "{why}");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(USAGE_FILE);
+        for bytes in [&b"{ not json"[..], b"", b"null", b"\xff\xfe"] {
+            std::fs::write(&file, bytes).unwrap();
+            unreadable(dir.path(), &format!("{bytes:?}"));
+            assert_eq!(std::fs::read(&file).unwrap(), bytes, "the bytes are left as they were");
+        }
+
+        // A folder where the file should be.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(USAGE_FILE)).unwrap();
+        unreadable(dir.path(), "a folder");
+        assert!(dir.path().join(USAGE_FILE).is_dir());
+
+        // Too big to be a real one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join(USAGE_FILE)).unwrap().set_len(MAX_USAGE_BYTES + 1).unwrap();
+        unreadable(dir.path(), "too big");
+
+        // A file it may not read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join(USAGE_FILE);
+            std::fs::write(&file, br#"{"version":1,"cost_usd":2.0}"#).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads it anyway; the case only means something where the permission holds.
+            if std::fs::read(&file).is_err() {
+                unreadable(dir.path(), "no read permission");
+            }
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        // A readable one is known, with the fields it has.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(USAGE_FILE), br#"{"version":1,"cost_usd":2.0,"priced":true}"#).unwrap();
+        let UsageRead::Known(u) = ProjectUsage::read(dir.path()) else { panic!("a readable file is known") };
+        assert_eq!((u.cost_usd, u.priced), (2.0, true));
     }
 
     /// A build turn and a question can save their cost together: neither may overwrite the other.
@@ -1565,7 +1682,7 @@ mod tests {
                 });
             }
         });
-        let u = ProjectUsage::load(root);
+        let u = ProjectUsage::read(root).known().unwrap();
         assert!((u.cost_usd - 2.0).abs() < 1e-6, "{u:?}");
         assert!(u.priced);
     }
@@ -1982,6 +2099,47 @@ mod tests {
         let saved: Value = serde_json::from_slice(&std::fs::read(dir.path().join(MANIFEST)).unwrap()).unwrap();
         assert_eq!(saved["version"], MANIFEST_VERSION);
         assert_eq!(saved["agent_session_deep"], want == Some(true));
+    }
+
+    /// Review of #2099: a version-5 build can't save over a recorded toolchain, and a version-5
+    /// manifest opens here unchanged but for its number.
+    #[test]
+    fn a_recorded_toolchain_is_kept_from_older_builds() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Game", "a game", TargetRef::None).unwrap();
+        ws.manifest.toolchain = Some("Gradle".into());
+        ws.save().unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(ws.root.join("craft.json")).unwrap()).unwrap();
+        assert_eq!((saved["version"].as_u64(), saved["toolchain"].as_str()), (Some(6), Some("Gradle")));
+        // A version-5 build reads up to 5, so it opens this one read-only (newer_manifests_open_read_only_and_are_never_overwritten).
+        let mut old = saved.clone();
+        old["version"] = 5.into();
+        old.as_object_mut().unwrap().remove("toolchain");
+        let m = read_manifest(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!((m.version, m.toolchain), (MANIFEST_VERSION, None), "brought forward with no toolchain");
+    }
+
+    /// Review of #2099: a build holding a copy read before a newer build brought the file forward
+    /// (both running at once) doesn't save over it, by any of the ways it saves.
+    #[test]
+    fn a_copy_read_before_a_newer_build_saved_doesnt_overwrite_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut ws = Workspace::create(d.path(), "Game", "a game", TargetRef::None).unwrap();
+        let mut newer: Value = serde_json::from_slice(&std::fs::read(ws.root.join(MANIFEST)).unwrap()).unwrap();
+        newer["version"] = (MANIFEST_VERSION + 1).into();
+        newer["a_field_from_the_future"] = "kept".into();
+        let newer = serde_json::to_string_pretty(&newer).unwrap();
+        std::fs::write(ws.root.join(MANIFEST), &newer).unwrap();
+        assert!(!ws.is_read_only(), "this copy was read before");
+        let err = ws.set_status(Status::Building, "x").unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotSupported);
+        assert!(err.message.contains(&format!("version {}", MANIFEST_VERSION + 1)), "{}", err.message);
+        assert_eq!(ws.save().unwrap_err().code, ErrorCode::NotSupported);
+        assert_eq!(ws.set_person(|m| m.note = "x".into()).unwrap_err().code, ErrorCode::NotSupported);
+        assert_eq!(std::fs::read_to_string(ws.root.join(MANIFEST)).unwrap(), newer, "the file is untouched");
+        // Its own version on disk still saves.
+        std::fs::write(ws.root.join(MANIFEST), b"not json").unwrap();
+        ws.save().unwrap();
     }
 
     /// #469: a saved session is only for the agent that saved it.

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 craft-evm = { workspace = true }
 craft-java-class = { workspace = true }
+craft-android-res = { workspace = true }
 craft-pcap = { workspace = true }
 craft-wasm = { workspace = true }
 craft-dex = { workspace = true }
@@ -25,6 +26,9 @@ craft-mime = { workspace = true }
 craft-plist = { workspace = true }
 craft-zip = { workspace = true }
 craft-tar = { workspace = true }
+craft-pkcs7 = { workspace = true }
+craft-sqlite = { workspace = true }
+craft-dds = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
