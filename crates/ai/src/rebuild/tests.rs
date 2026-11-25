@@ -2279,16 +2279,14 @@ mod picking_up_a_build {
         let port = Workspace::open(&ws.root).unwrap().manifest.standin_port.expect("the port is kept with the project");
         let url = format!("http://127.0.0.1:{port}");
         assert!(told.contains(&format!("{url} answers your front end")), "the follow-up gives the address: {told}");
-        let out = b.hub.engine.call("web_standin_show", json!({}), CallOptions::new(Caller::Ui)).unwrap();
-        let ToolOutput::Value(shown) = out else { panic!("{out:?}") };
-        assert_eq!(shown["servers"], json!([]), "stopped when the build ended");
+        // The run serves it from its own session, so what shows it stopped is its port.
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "stopped when the build ended");
         // A build that ends without a working app stops it too.
         std::fs::write(ws.root.join("reject-build"), "always").unwrap();
         let (ok, _) = try_with(&b, &ws, RunOptions { message: Some("Try once more.".into()), ..RunOptions::default() });
         assert!(!ok);
-        let out = b.hub.engine.call("web_standin_show", json!({}), CallOptions::new(Caller::Ui)).unwrap();
-        let ToolOutput::Value(shown) = out else { panic!("{out:?}") };
-        assert_eq!(shown["servers"], json!([]), "stopped when the build failed");
+        let port = Workspace::open(&ws.root).unwrap().manifest.standin_port.expect("the port is kept with the project");
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "stopped when the build failed");
     }
 
     #[test]
