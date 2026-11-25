@@ -2279,14 +2279,26 @@ mod picking_up_a_build {
         let port = Workspace::open(&ws.root).unwrap().manifest.standin_port.expect("the port is kept with the project");
         let url = format!("http://127.0.0.1:{port}");
         assert!(told.contains(&format!("{url} answers your front end")), "the follow-up gives the address: {told}");
-        // The run serves it from its own session, so what shows it stopped is its port.
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "stopped when the build ended");
+        assert_eq!(stopped_by_its_runs(&ws), 1, "stopped when the build ended");
         // A build that ends without a working app stops it too.
         std::fs::write(ws.root.join("reject-build"), "always").unwrap();
         let (ok, _) = try_with(&b, &ws, RunOptions { message: Some("Try once more.".into()), ..RunOptions::default() });
         assert!(!ok);
-        let port = Workspace::open(&ws.root).unwrap().manifest.standin_port.expect("the port is kept with the project");
-        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err(), "stopped when the build failed");
+        assert_eq!(stopped_by_its_runs(&ws), 2, "stopped when the build failed");
+    }
+
+    /// How many stand-ins runs started for `ws`, failing if any is still in its run's registry. A
+    /// port says nothing once freed (another test's server can take it), and the run's session
+    /// isn't the app's, so it asks the registry the run served it from; that a stopped one frees
+    /// its server and answerer is the stand-in tools' own test.
+    fn stopped_by_its_runs(ws: &Workspace) -> usize {
+        let started = crate::rebuild::recorded_backend::STARTED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ours: Vec<_> = started.iter().filter(|(root, ..)| *root == ws.root).collect();
+        for (_, id, servers) in &ours {
+            // `stop` says whether it was still running; a dropped registry stopped all of its own.
+            assert!(!servers.upgrade().is_some_and(|s| s.stop(id)), "{id} still runs in its run's session");
+        }
+        ours.len()
     }
 
     #[test]

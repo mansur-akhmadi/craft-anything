@@ -35,6 +35,11 @@ pub(super) fn recording(ws: &Workspace) -> Option<PathBuf> {
     own.is_file().then_some(own)
 }
 
+/// Each stand-in a run started in a test, by project, with the registry of the run's own session
+/// it's served from: the run's session isn't the app's, and its port can be another's once freed.
+#[cfg(test)]
+pub(super) static STARTED: Mutex<Vec<(PathBuf, String, std::sync::Weak<Servers>)>> = Mutex::new(Vec::new());
+
 /// A stand-in this run started and doesn't hold yet, stopped if it's dropped still here: an event's
 /// callback that panics before the run takes it would otherwise leave it running in the session.
 struct Unkept(Option<RunningStandIn>);
@@ -77,6 +82,10 @@ impl Worker {
                     .map(|p| format!(" (port {p}, the one it used last time, is taken)"))
                     .unwrap_or_default();
                 let text = format!("A stand-in backend answers from the original's recording at {}{moved}.", running.url);
+                #[cfg(test)]
+                if let Some(servers) = &running.servers {
+                    STARTED.lock().unwrap_or_else(PoisonError::into_inner).push((ws.root.clone(), running.id.clone(), Arc::downgrade(servers)));
+                }
                 self.standin = Some(running);
                 unkept.0 = None;
                 self.emit(RunEvent::Agent(AgentEvent::Status { text }));
