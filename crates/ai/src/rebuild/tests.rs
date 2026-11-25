@@ -701,6 +701,7 @@ fn notes_worker(ws: &Workspace, run: &RebuildRun) -> Worker {
         self_check: None,
         reset_progress_after_notes: false,
         taken_in_turn: Vec::new(),
+        standin: None,
     }
 }
 
