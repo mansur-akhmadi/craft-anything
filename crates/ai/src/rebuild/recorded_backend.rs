@@ -53,7 +53,7 @@ impl Drop for Unkept {
 /// message (its address can change from one run to the next).
 pub(super) fn running_words(url: &str) -> String {
     format!(
-        "Craft Anything is already serving a stand-in backend built from the original's recorded traffic in capture/, so you don't need to start one: {url} answers your front end with what the original's backend answered (writes get the recorded answer and change nothing). While you build and check, point the front end's API calls there instead of the original's servers, through one development setting whose default stays the original's API: the stand-in runs only while Craft Anything builds, not when the app is opened later."
+        "Craft Anything is already serving a stand-in backend built from the original's recorded traffic in capture/, so you don't need to start one: {url} answers your front end with what the original's backend answered (a write the original made moves later reads on to what it answered after that write, a write it never made is refused with a 404, and each check starts the stand-in from the beginning of the recording). While you build and check, point the front end's API calls there instead of the original's servers, through one development setting whose default stays the original's API: the stand-in runs only while Craft Anything builds, not when the app is opened later."
     )
 }
 
